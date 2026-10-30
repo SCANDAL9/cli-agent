@@ -1,0 +1,81 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & Coverage
+.coverage
+.coverage.*
+coverage.xml
+coverage_html/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.hypothesis/
+
+# Local Environment & Secrets (Strict GitHub Leak Prevention)
+.env
+.env.*
+*.env
+*.secret
+*.secrets
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*credentials*.json
+*service_account*.json
+*service-account*.json
+client_secret*.json
+id_rsa*
+id_ed25519*
+
+# SQLite Databases & Local Storage
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-*
+
+# Local Configuration & User History
+config.toml
+mcp_servers.json
+mcp.json
+model_catalog*.json
+history
+.history/
+*.history
+*.local
+.gcloud/
+
+# Ephemeral Git Worktrees & Logs
+/tmp/cli-agent/
+worktrees/
+*.log
+
+# OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
