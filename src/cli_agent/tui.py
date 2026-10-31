@@ -28,6 +28,18 @@ from rich.text import Text
 from rich.tree import Tree
 
 from .circuit_breaker import CircuitState, EndpointHealthSnapshot, ModelEndpoint
+from .events import (
+    CircuitHealthPayload,
+    EventBus,
+    EventEnvelope,
+    EventTopic,
+    SubprocLogPayload,
+    SwarmNodeStatePayload,
+    TokenStreamPayload,
+    TUIControlPayload,
+    WorktreeDiffPayload,
+    get_event_bus,
+)
 from .pr import SymbolDelta
 
 
@@ -466,6 +478,166 @@ class TUILayoutManager:
         )
 
 
+class TUIEventBusBridge:
+    """Bi-directional bridge connecting EventBus telemetry to TUIApp viewports."""
+
+    def __init__(
+        self,
+        app: TUIApp,
+        event_bus: EventBus | None = None,
+        fps_limit: int = 60,
+    ) -> None:
+        self.app = app
+        self.event_bus = event_bus or get_event_bus()
+        self.fps_limit = fps_limit
+        self.subscription = self.event_bus.subscribe(
+            topics=[
+                EventTopic.TOKEN_STREAM,
+                EventTopic.SWARM_NODE_STATE,
+                EventTopic.WORKTREE_DIFF_UPDATED,
+                EventTopic.SUBPROC_LOG,
+                EventTopic.CIRCUIT_HEALTH,
+            ]
+        )
+        self._stop_event = asyncio.Event()
+        self._bridge_task: asyncio.Task[None] | None = None
+        self._swarm_nodes: dict[str, SwarmNodeStatePayload] = {}
+
+    def publish_control(self, action: str, argument: str = "") -> EventEnvelope:
+        """Publishes a TUI control signal back onto the EventBus."""
+        return self.event_bus.publish_nowait(
+            EventTopic.TUI_CONTROL,
+            TUIControlPayload(action=action, argument=argument),
+        )
+
+    def apply_envelope(self, env: EventEnvelope) -> None:
+        """Dispatches an individual event envelope to the relevant TUIApp pane."""
+        if env.topic == EventTopic.TOKEN_STREAM and isinstance(env.payload, TokenStreamPayload):
+            token_payload = env.payload
+            if token_payload.delta:
+                self.app.chat_pane.append_streaming_token(token_payload.delta)
+            if token_payload.is_complete:
+                self.app.chat_pane.commit_streaming_turn()
+            if token_payload.input_tokens > 0:
+                self.app.status_hud.tokens_in = token_payload.input_tokens
+            if token_payload.output_tokens > 0:
+                self.app.status_hud.tokens_out = token_payload.output_tokens
+
+        elif env.topic == EventTopic.SWARM_NODE_STATE and isinstance(
+            env.payload, SwarmNodeStatePayload
+        ):
+            swarm_payload = env.payload
+            self._swarm_nodes[swarm_payload.node_id] = swarm_payload
+            self._rebuild_swarm_hierarchy()
+
+        elif env.topic == EventTopic.WORKTREE_DIFF_UPDATED and isinstance(
+            env.payload, WorktreeDiffPayload
+        ):
+            diff_payload = env.payload
+            self.app.diff_pane.update_file_diff(
+                file_path=diff_payload.file_path,
+                diff_text=diff_payload.diff_text,
+                symbol_delta=diff_payload.symbol_delta,
+            )
+
+        elif env.topic == EventTopic.SUBPROC_LOG and isinstance(env.payload, SubprocLogPayload):
+            log_payload = env.payload
+            try:
+                src = LogSource(log_payload.source.upper())
+            except ValueError:
+                src = LogSource.ALL
+            self.app.log_pane.append_log(src, log_payload.line)
+
+        elif env.topic == EventTopic.CIRCUIT_HEALTH and isinstance(
+            env.payload, CircuitHealthPayload
+        ):
+            circuit_payload = env.payload
+            endpoint = ModelEndpoint(
+                circuit_payload.model_id, circuit_payload.region, circuit_payload.tier
+            )
+            snapshot = EndpointHealthSnapshot(
+                endpoint=endpoint,
+                state=circuit_payload.state,
+                consecutive_failures=circuit_payload.failure_count,
+                cooldown_remaining_seconds=circuit_payload.cooldown_remaining_s,
+            )
+            self.app.status_hud.endpoint = endpoint
+            self.app.status_hud.circuit_snapshot = snapshot
+            self.app.status_hud.vad_listening = circuit_payload.vad_active
+
+    def apply_coalesced_batch(self, batch: Sequence[EventEnvelope]) -> None:
+        """Applies a sequence of coalesced envelopes in batch."""
+        for env in batch:
+            self.apply_envelope(env)
+
+    def _rebuild_swarm_hierarchy(self) -> None:
+        if not self._swarm_nodes:
+            return
+
+        root_payload: SwarmNodeStatePayload | None = None
+        for n in self._swarm_nodes.values():
+            if n.role.lower() in ("architect", "lead") or not n.dependencies:
+                root_payload = n
+                break
+        if root_payload is None:
+            root_payload = next(iter(self._swarm_nodes.values()))
+
+        children = [
+            SwarmNode(
+                agent_id=n.node_id,
+                role=n.role.capitalize(),
+                status=n.status,
+                active_tool=n.active_tool,
+                worktree_branch=n.worktree_branch,
+            )
+            for n in self._swarm_nodes.values()
+            if n.node_id != root_payload.node_id
+        ]
+
+        self.app.chat_pane.update_swarm(
+            SwarmNode(
+                agent_id=root_payload.node_id,
+                role=root_payload.role.capitalize(),
+                status=root_payload.status,
+                active_tool=root_payload.active_tool,
+                worktree_branch=root_payload.worktree_branch,
+                children=children,
+            )
+        )
+        active_count = sum(
+            1 for n in self._swarm_nodes.values() if n.status.upper() in ("RUNNING", "READY")
+        )
+        self.app.status_hud.active_swarms = active_count
+
+    def start(self) -> asyncio.Task[None] | None:
+        """Starts background frame coalescing consumer task if event loop is running."""
+        self._stop_event.clear()
+        try:
+            loop = asyncio.get_running_loop()
+            self._bridge_task = loop.create_task(self._run_loop())
+            return self._bridge_task
+        except RuntimeError:
+            return None
+
+    def stop(self) -> None:
+        """Stops the bridge task and unsubscribes from EventBus."""
+        self._stop_event.set()
+        if self._bridge_task and not self._bridge_task.done():
+            self._bridge_task.cancel()
+            self._bridge_task = None
+        self.event_bus.unsubscribe(self.subscription)
+
+    async def _run_loop(self) -> None:
+        """Consumes coalesced frames and updates TUI panes."""
+        try:
+            async for frame in self.event_bus.iter_coalesced_frames(
+                self.subscription, self._stop_event, fps_limit=self.fps_limit
+            ):
+                self.apply_coalesced_batch(frame)
+        except asyncio.CancelledError:
+            pass
+
+
 class TUIApp:
     """Non-blocking terminal application driver managing the event loop and key dispatch."""
 
@@ -474,6 +646,7 @@ class TUIApp:
         layout_manager: TUILayoutManager | None = None,
         on_submit_prompt: Callable[[str], Any] | None = None,
         output_writer: Callable[[str], None] | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.chat_pane = ChatPane()
         self.diff_pane = DiffViewerPane()
@@ -490,9 +663,17 @@ class TUIApp:
         self._event_queue: asyncio.Queue[TUIEvent] = asyncio.Queue()
         self.is_running: bool = False
         self.in_alternate_screen: bool = False
+        self.event_bus = event_bus or get_event_bus()
+        self.bridge = TUIEventBusBridge(app=self, event_bus=self.event_bus)
 
     def post_event(self, event: TUIEvent) -> None:
         self._event_queue.put_nowait(event)
+
+    def submit_prompt(self, prompt: str) -> None:
+        """Submits user prompt, notifies event bus and invokes callback if registered."""
+        self.bridge.publish_control("SUBMIT_PROMPT", prompt)
+        if self.on_submit_prompt:
+            self.on_submit_prompt(prompt)
 
     def handle_key(self, key: str) -> str | None:
         """Dispatches key to focused pane; returns command (e.g. '/tui') if triggered."""
@@ -504,15 +685,24 @@ class TUIApp:
             return None
         if key == "Ctrl+D" or key == "c-d":
             self.diff_pane.toggle_view_mode()
+            self.bridge.publish_control("TOGGLE_DIFF_MODE")
             return None
         if key == "Ctrl+L" or key == "c-l":
             self.log_pane.clear()
             return None
         if key == "]":
             self.diff_pane.cycle_file(1)
+            self.bridge.publish_control("CYCLE_DIFF_FILE", "+1")
             return None
         if key == "[":
             self.diff_pane.cycle_file(-1)
+            self.bridge.publish_control("CYCLE_DIFF_FILE", "-1")
+            return None
+        if key in ("Ctrl+C", "c-c"):
+            self.bridge.publish_control("CANCEL_SWARM", "user_interrupt")
+            return None
+        if key in ("Ctrl+V", "c-v", "/voice"):
+            self.bridge.publish_control("TOGGLE_VOICE")
             return None
         if key in ("Up", "up"):
             if self.layout_manager.focused_pane == FocusPane.CHAT:
@@ -539,11 +729,13 @@ class TUIApp:
         self.is_running = True
         self.in_alternate_screen = True
         self._output_writer("\x1b[?1049h")  # Enter alternate screen buffer
+        self.bridge.start()
 
     def stop(self) -> None:
         self.is_running = False
         self.in_alternate_screen = False
         self._output_writer("\x1b[?1049l")  # Exit alternate screen buffer
+        self.bridge.stop()
 
     def run(self) -> VirtualScreenBuffer:
         """Boots the 4-zone fullscreen split-pane terminal workspace and renders a frame."""

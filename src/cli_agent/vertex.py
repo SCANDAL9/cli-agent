@@ -35,7 +35,7 @@ DEFAULT_LOCATION = os.getenv("GEMINI_LOCATION", "global")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
-DEFAULT_TIMEOUT = httpx.Timeout(180.0, connect=15.0)
+DEFAULT_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 
 class VertexAgentClient:
@@ -280,9 +280,12 @@ Guidelines:
             client_owner = True
 
         try:
+            from .context import prune_tool_responses
+
             for _ in range(max_turns):
+                pruned_contents = prune_tool_responses(working_contents, max_chars=4000)
                 payload: dict[str, Any] = {
-                    "contents": working_contents,
+                    "contents": pruned_contents,
                     "system_instruction": {"parts": [{"text": active_instruction}]},
                     "generationConfig": {"temperature": 0.2},
                 }
@@ -292,84 +295,107 @@ Guidelines:
                 function_calls: list[dict[str, Any]] = []
                 full_content_parts: list[dict[str, Any]] = []
 
-                async with client.stream(
-                    "POST",
-                    f"{self.stream_endpoint}?alt=sse",
-                    headers=headers,
-                    json=payload,
-                    timeout=DEFAULT_TIMEOUT,
-                ) as response:
-                    if response.status_code in (404, 429, 503):
-                        err_body = await response.aread()
-                        err_text = err_body.decode(errors="replace")
-                        if self.circuit_breaker is not None and self.fallback_router is not None:
-                            current_ep = ModelEndpoint(self.model_name, self.location)
-                            self.circuit_breaker.record_failure(
-                                current_ep,
-                                status_code=response.status_code,
-                                error_body=err_text,
-                                headers=dict(response.headers),
-                            )
-                            try:
-                                fallback_ep = self.fallback_router.select_endpoint()
-                            except ExhaustedFallbackChainError:
-                                fallback_ep = None
+                try:
+                    async with client.stream(
+                        "POST",
+                        f"{self.stream_endpoint}?alt=sse",
+                        headers=headers,
+                        json=payload,
+                        timeout=DEFAULT_TIMEOUT,
+                    ) as response:
+                        if response.status_code in (404, 429, 503):
+                            err_body = await response.aread()
+                            err_text = err_body.decode(errors="replace")
+                            if (
+                                self.circuit_breaker is not None
+                                and self.fallback_router is not None
+                            ):
+                                current_ep = ModelEndpoint(self.model_name, self.location)
+                                self.circuit_breaker.record_failure(
+                                    current_ep,
+                                    status_code=response.status_code,
+                                    error_body=err_text,
+                                    headers=dict(response.headers),
+                                )
+                                try:
+                                    fallback_ep = self.fallback_router.select_endpoint()
+                                except ExhaustedFallbackChainError:
+                                    fallback_ep = None
 
-                            if fallback_ep is not None and fallback_ep.key != current_ep.key:
-                                self.location = fallback_ep.region
-                                self.switch_model(fallback_ep.model_id)
+                                if fallback_ep is not None and fallback_ep.key != current_ep.key:
+                                    self.location = fallback_ep.region
+                                    self.switch_model(fallback_ep.model_id)
+                                    continue
+
+                            if response.status_code == 429:
+                                err_detail = ""
+                                try:
+                                    err_json = json.loads(err_text)
+                                    err_detail = err_json.get("error", {}).get("message", "")
+                                except Exception:
+                                    err_detail = err_text
+                                remediation = f"\nDetail: {err_detail}" if err_detail else ""
+                                tip = (
+                                    "\nTip: Third-party models (Claude, Grok) require requesting quota in GCP Quotas console. "
+                                    "Switch back with '/model gemini-3.8-flash'."
+                                    if self.publisher != "google"
+                                    else ""
+                                )
+                                raise RuntimeError(
+                                    f"Vertex AI rate limit exceeded (HTTP 429).{remediation}{tip}"
+                                )
+                            raise RuntimeError(
+                                f"Vertex AI API error ({response.status_code}): {err_text}"
+                            )
+                        if response.status_code != 200:
+                            err_body = await response.aread()
+                            raise RuntimeError(
+                                f"Vertex AI API error ({response.status_code}): {err_body.decode()}"
+                            )
+
+                        if self.circuit_breaker is not None:
+                            self.circuit_breaker.record_success(
+                                ModelEndpoint(self.model_name, self.location)
+                            )
+
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            raw = line[6:].strip()
+                            if not raw or raw == "[DONE]":
                                 continue
 
-                        if response.status_code == 429:
-                            err_detail = ""
-                            try:
-                                err_json = json.loads(err_text)
-                                err_detail = err_json.get("error", {}).get("message", "")
-                            except Exception:
-                                err_detail = err_text
-                            remediation = f"\nDetail: {err_detail}" if err_detail else ""
-                            tip = (
-                                "\nTip: Third-party models (Claude, Grok) require requesting quota in GCP Quotas console. "
-                                "Switch back with '/model gemini-3.8-flash'."
-                                if self.publisher != "google"
-                                else ""
-                            )
-                            raise RuntimeError(
-                                f"Vertex AI rate limit exceeded (HTTP 429).{remediation}{tip}"
-                            )
-                        raise RuntimeError(
-                            f"Vertex AI API error ({response.status_code}): {err_text}"
+                            chunk_data = json.loads(raw)
+                            candidates = chunk_data.get("candidates", [])
+                            if not candidates:
+                                continue
+
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            for p in parts:
+                                full_content_parts.append(p)
+                                if "text" in p:
+                                    yield p["text"]
+                                elif "functionCall" in p:
+                                    function_calls.append(p["functionCall"])
+                except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+                    if self.circuit_breaker is not None and self.fallback_router is not None:
+                        current_ep = ModelEndpoint(self.model_name, self.location)
+                        self.circuit_breaker.record_failure(
+                            current_ep,
+                            status_code=504,
+                            error_body=str(net_err),
+                            headers={},
                         )
-                    if response.status_code != 200:
-                        err_body = await response.aread()
-                        raise RuntimeError(
-                            f"Vertex AI API error ({response.status_code}): {err_body.decode()}"
-                        )
+                        try:
+                            fallback_ep = self.fallback_router.select_endpoint()
+                        except ExhaustedFallbackChainError:
+                            fallback_ep = None
 
-                    if self.circuit_breaker is not None:
-                        self.circuit_breaker.record_success(
-                            ModelEndpoint(self.model_name, self.location)
-                        )
-
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
+                        if fallback_ep is not None and fallback_ep.key != current_ep.key:
+                            self.location = fallback_ep.region
+                            self.switch_model(fallback_ep.model_id)
                             continue
-                        raw = line[6:].strip()
-                        if not raw or raw == "[DONE]":
-                            continue
-
-                        chunk_data = json.loads(raw)
-                        candidates = chunk_data.get("candidates", [])
-                        if not candidates:
-                            continue
-
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        for p in parts:
-                            full_content_parts.append(p)
-                            if "text" in p:
-                                yield p["text"]
-                            elif "functionCall" in p:
-                                function_calls.append(p["functionCall"])
+                    raise RuntimeError(f"Vertex AI network/timeout error: {net_err}") from net_err
 
                 if not function_calls:
                     return
