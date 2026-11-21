@@ -24,7 +24,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from .circuit_breaker import FallbackRouter, ModelEndpoint, QuotaCircuitBreaker
+from .circuit_breaker import QuotaCircuitBreaker
 from .code_graph import CodeGraphIndexer
 from .config import DEFAULT_HISTORY_FILE, load_config, save_model_to_config
 from .context import compact_history, extract_session_learnings
@@ -561,6 +561,8 @@ class RichMarkdownStreamer:
         self._live = None
 
     def on_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
         if not self._header_shown and self.prompt_label:
             self.console.print(self.prompt_label, end="")
             self._header_shown = True
@@ -684,24 +686,15 @@ async def run_interactive(
     project_key = resolve_project_key()
     security_policy = make_security_policy(auto_approve=auto_approve or cfg.auto_approve)
     circuit_breaker = QuotaCircuitBreaker()
-    t2_model = "gemini-3.8-flash" if model != "gemini-3.8-flash" else "gemini-3.7-flash"
-    t3_model = "gemini-3.7-flash" if model != "gemini-3.7-flash" else "gemini-3.8-flash"
-    fallback_router = FallbackRouter(
-        circuit_breaker,
-        [
-            ModelEndpoint(model, cfg.location, tier=1),
-            ModelEndpoint(t2_model, "global", tier=2),
-            ModelEndpoint(t3_model, "global", tier=3),
-        ],
-    )
     client = VertexAgentClient(
         project_id=cfg.project,
         location=cfg.location,
         model_name=model,
         memory_store=memory_store,
         security_policy=security_policy,
-        fallback_router=fallback_router,
+        fallback_router=None,
         circuit_breaker=circuit_breaker,
+        timeout=cfg.timeout,
     )
 
     active_session_id: str = generate_session_id()
@@ -1565,24 +1558,54 @@ async def run_interactive(
         conversation_history = compact_history(conversation_history, max_turns=12, keep_recent=6)
 
         streamer = RichMarkdownStreamer(console=console)
+        status = console.status("[dim cyan]Thinking...[/dim cyan]", spinner="dots")
+        status_active = False
+
+        def _handle_tool_call(
+            name: str,
+            args: dict[str, Any],
+            _status: Any = status,
+            _streamer: RichMarkdownStreamer = streamer,
+        ) -> None:
+            nonlocal status_active
+            if status_active:
+                _status.stop()
+                status_active = False
+            _streamer.on_tool_call(name, args)
+
         try:
-            with console.status("[dim cyan]Thinking...[/dim cyan]", spinner="dots"):
-                stream_iter = client.stream_chat(
-                    conversation_history, on_tool_call=streamer.on_tool_call
-                )
-                try:
-                    first_chunk = await stream_iter.__anext__()
-                except StopAsyncIteration:
-                    first_chunk = None
+            status.start()
+            status_active = True
+            stream_iter = client.stream_chat(
+                conversation_history, on_tool_call=_handle_tool_call
+            )
+            try:
+                first_chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                first_chunk = None
+            finally:
+                if status_active:
+                    status.stop()
+                    status_active = False
+
             if first_chunk is not None:
                 streamer.on_chunk(first_chunk)
                 async for chunk in stream_iter:
                     streamer.on_chunk(chunk)
             full_response = streamer.finalize()
         except Exception as e:
+            if status_active:
+                status.stop()
+                status_active = False
             if streamer._live is not None:
                 streamer._live.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
+            # Remove unanswered user turn so it doesn't corrupt subsequent prompts
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            console.print(
+                f"\n[bold red]✖ No hubo respuesta del modelo '[bold]{client.model_name}[/bold]':[/bold red] {e}\n"
+                "[bold yellow]→ Cambia de modelo con [bold]/model[/bold] para continuar.[/bold yellow]"
+            )
             continue
 
         if full_response.strip():
@@ -1592,6 +1615,14 @@ async def run_interactive(
                 messages=conversation_history,
                 model_name=client.model_name,
                 project_key=project_key,
+            )
+        else:
+            # Remove unanswered user turn and notify the user instead of failing silently
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            console.print(
+                "[dim yellow]⚠ El modelo completó el turno sin texto de respuesta "
+                f"(modelo activo: [bold]{client.model_name}[/bold]). Intenta reformular o cambiar de modelo con [bold]/model[/bold].[/dim yellow]"
             )
 
 
@@ -1636,24 +1667,15 @@ async def run_oneshot(
     project_key = resolve_project_key()
     security_policy = make_security_policy(auto_approve=auto_approve or cfg.auto_approve)
     circuit_breaker = QuotaCircuitBreaker()
-    t2_model = "gemini-3.8-flash" if model != "gemini-3.8-flash" else "gemini-3.7-flash"
-    t3_model = "gemini-3.7-flash" if model != "gemini-3.7-flash" else "gemini-3.8-flash"
-    fallback_router = FallbackRouter(
-        circuit_breaker,
-        [
-            ModelEndpoint(model, cfg.location, tier=1),
-            ModelEndpoint(t2_model, "global", tier=2),
-            ModelEndpoint(t3_model, "global", tier=3),
-        ],
-    )
     client = VertexAgentClient(
         project_id=cfg.project,
         location=cfg.location,
         model_name=model,
         memory_store=memory_store,
         security_policy=security_policy,
-        fallback_router=fallback_router,
+        fallback_router=None,
         circuit_breaker=circuit_breaker,
+        timeout=cfg.timeout,
     )
 
     active_session_id: str = generate_session_id()
@@ -1702,7 +1724,10 @@ async def run_oneshot(
         if streamer._live is not None:
             streamer._live.stop()
         err_msg = str(e) or repr(e)
-        console.print(f"[bold red]Error ({type(e).__name__}):[/bold red] {err_msg}")
+        console.print(
+            f"[bold red]✖ No hubo respuesta del modelo '{client.model_name}' ({type(e).__name__}):[/bold red] {err_msg}\n"
+            "[bold yellow]→ Cambia de modelo con [bold]--model <nombre>[/bold] o [bold]/model[/bold].[/bold yellow]"
+        )
         sys.exit(1)
 
 

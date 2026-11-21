@@ -170,7 +170,7 @@ Guidelines:
         client_owner = False
         client = self._http_client
         if client is None:
-            client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+            client = httpx.AsyncClient(timeout=self.timeout)
             client_owner = True
 
         try:
@@ -284,7 +284,7 @@ Guidelines:
         client_owner = False
         client = self._http_client
         if client is None:
-            client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+            client = httpx.AsyncClient(timeout=self.timeout)
             client_owner = True
 
         try:
@@ -309,7 +309,7 @@ Guidelines:
                         f"{self.stream_endpoint}?alt=sse",
                         headers=headers,
                         json=payload,
-                        timeout=DEFAULT_TIMEOUT,
+                        timeout=self.timeout,
                     ) as response:
                         if response.status_code in (404, 429, 503):
                             err_body = await response.aread()
@@ -350,10 +350,10 @@ Guidelines:
                                     else ""
                                 )
                                 raise RuntimeError(
-                                    f"Vertex AI rate limit exceeded (HTTP 429).{remediation}{tip}"
+                                    f"Vertex AI rate limit exceeded (HTTP 429) for model '{self.model_name}'.{remediation}{tip}"
                                 )
                             raise RuntimeError(
-                                f"Vertex AI API error ({response.status_code}): {err_text}"
+                                f"Vertex AI API error ({response.status_code}) for model '{self.model_name}': {err_text}"
                             )
                         if response.status_code != 200:
                             err_body = await response.aread()
@@ -381,7 +381,7 @@ Guidelines:
                             parts = candidates[0].get("content", {}).get("parts", [])
                             for p in parts:
                                 full_content_parts.append(p)
-                                if "text" in p:
+                                if "text" in p and p["text"] and not p.get("thought"):
                                     yield p["text"]
                                 elif "functionCall" in p:
                                     function_calls.append(p["functionCall"])
@@ -436,6 +436,8 @@ Guidelines:
                     )
 
                 working_contents.append({"role": "user", "parts": tool_response_parts})
+
+            yield "\n\n*(Reached maximum tool iterations limit without a final response.)*"
 
         finally:
             if client_owner:
