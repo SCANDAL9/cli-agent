@@ -6,12 +6,17 @@ Implements Organic Driven Development (ODD) with role-specialized agent loops:
 - QA Verifier: Independent validation, test execution, regression detection.
 """
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .tools import GEMINI_TOOLS_DECLARATIONS
+from .tools import (
+    GEMINI_TOOLS_DECLARATIONS,
+    reset_allowed_write_paths,
+    set_allowed_write_paths,
+)
 from .vertex import VertexAgentClient
 
 MAX_DELEGATION_DEPTH = 3
@@ -169,6 +174,11 @@ class MultiAgentTeam:
         )
         initial_messages = [{"role": "user", "parts": [{"text": user_content}]}]
 
+        # Enforce hard write restriction scope at contextvar level if worker has allowed_files
+        token = None
+        if assignment.role == AgentRole.WORKER and assignment.allowed_files:
+            token = set_allowed_write_paths(assignment.allowed_files)
+
         try:
             summary = await self.client.chat(
                 messages=initial_messages,
@@ -195,6 +205,9 @@ class MultiAgentTeam:
                 turn_count=turn_counter,
                 error=str(e),
             )
+        finally:
+            if token is not None:
+                reset_allowed_write_paths(token)
 
         self._active_workers.append(result)
         return result
@@ -202,6 +215,7 @@ class MultiAgentTeam:
     async def run_workflow(
         self,
         goal: str,
+        max_feedback_rounds: int = 3,
         on_event: Callable[[str, str], None] | None = None,
     ) -> TeamWorkflowResult:
         """
@@ -209,7 +223,8 @@ class MultiAgentTeam:
         1. Lead Architect formulates the architectural plan.
         2. Feature Worker implements the discrete task unit.
         3. Independent QA Verifier runs test suite and validates regressions.
-        4. Architect synthesizes the final outcome.
+        4. If QA fails and rounds remain, loops feedback back to Worker to self-heal.
+        5. Architect synthesizes the final outcome and records episodic memory reflection.
         """
         # Step 1: Lead Architect Planning
         if on_event:
@@ -226,52 +241,105 @@ class MultiAgentTeam:
             max_turns=3,
         )
 
-        # Step 2: Feature Worker Implementation
-        if on_event:
-            on_event("stage", "Phase 2: Feature Worker Implementation")
+        all_worker_results: list[WorkerResult] = []
+        qa_result: WorkerResult | None = None
+        current_objective = f"Implement feature according to plan:\n{plan}\nGoal: {goal}"
+        accumulated_files: list[str] = []
 
-        worker_assignment = TaskAssignment(
-            task_id="feat-worker-1",
-            role=AgentRole.WORKER,
-            objective=f"Implement feature according to plan:\n{plan}\nGoal: {goal}",
-            allowed_files=[],
-            max_turns=8,
-        )
-        worker_result = await self.spawn_worker(worker_assignment, depth=1, on_event=on_event)
+        # Iterative Worker <-> QA self-healing loop
+        for round_idx in range(1, max_feedback_rounds + 1):
+            if on_event:
+                stage_name = (
+                    f"Phase 2: Feature Worker Implementation (Round {round_idx})"
+                    if round_idx > 1
+                    else "Phase 2: Feature Worker Implementation"
+                )
+                on_event("stage", stage_name)
 
-        # Step 3: Independent QA Verification
-        if on_event:
-            on_event("stage", "Phase 3: Independent QA Verification")
+            worker_assignment = TaskAssignment(
+                task_id=f"feat-worker-r{round_idx}",
+                role=AgentRole.WORKER,
+                objective=current_objective,
+                allowed_files=[],
+                max_turns=8,
+            )
+            w_res = await self.spawn_worker(worker_assignment, depth=1, on_event=on_event)
+            all_worker_results.append(w_res)
+            for f in w_res.files_modified:
+                if f not in accumulated_files:
+                    accumulated_files.append(f)
 
-        qa_assignment = TaskAssignment(
-            task_id="qa-verifier-1",
-            role=AgentRole.QA,
-            objective=(
-                f"Verify the changes implemented by the Feature Worker.\n"
-                f"Modified files: {worker_result.files_modified}\n"
-                f"Run relevant test suites via run_command (e.g. pytest). Output PASS or FAIL with diagnostics."
-            ),
-            max_turns=4,
-        )
-        qa_result = await self.spawn_worker(qa_assignment, depth=1, on_event=on_event)
+            if on_event:
+                stage_name = (
+                    f"Phase 3: Independent QA Verification (Round {round_idx})"
+                    if round_idx > 1
+                    else "Phase 3: Independent QA Verification"
+                )
+                on_event("stage", stage_name)
 
-        # Step 4: Outcome Synthesis
+            qa_assignment = TaskAssignment(
+                task_id=f"qa-verifier-r{round_idx}",
+                role=AgentRole.QA,
+                objective=(
+                    f"Verify the changes implemented by the Feature Worker.\n"
+                    f"Modified files: {accumulated_files}\n"
+                    f"Run relevant test suites via run_command (e.g. pytest). Output PASS or FAIL with diagnostics."
+                ),
+                max_turns=4,
+            )
+            qa_result = await self.spawn_worker(qa_assignment, depth=1, on_event=on_event)
+
+            # Check if QA passed
+            qa_summary_upper = (qa_result.summary or "").upper()
+            is_pass = qa_result.status == "success" and "FAIL" not in qa_summary_upper
+
+            if is_pass:
+                if on_event:
+                    on_event("qa_pass", f"Round {round_idx}: QA verified all tests passed successfully!")
+                break
+
+            if round_idx < max_feedback_rounds:
+                if on_event:
+                    on_event(
+                        "qa_feedback",
+                        f"Round {round_idx}: QA reported test failures. Routing diagnostics back to Feature Worker...",
+                    )
+                current_objective = (
+                    f"Fix the test failures identified by QA Verifier in round {round_idx}.\n"
+                    f"QA Diagnostics and Error Trace:\n{qa_result.summary}\n"
+                    f"Goal: {goal}"
+                )
+
+        # Step 4: Outcome Synthesis & Reflection
         if on_event:
             on_event("stage", "Phase 4: Synthesis & Final Review")
 
-        overall_status = "success" if qa_result.status == "success" else "failed"
+        overall_status = "success" if (qa_result and qa_result.status == "success" and "FAIL" not in (qa_result.summary or "").upper()) else "failed"
+        last_worker = all_worker_results[-1] if all_worker_results else None
         final_summary = (
             f"### Multi-Agent Swarm Outcome ({overall_status.upper()})\n\n"
             f"**Goal:** {goal}\n\n"
             f"**Architecture Plan:**\n{plan}\n\n"
-            f"**Feature Worker Results:**\n- Status: {worker_result.status}\n- Modified Files: {worker_result.files_modified}\n- Summary: {worker_result.summary}\n\n"
-            f"**QA Verification:**\n- Status: {qa_result.status}\n- Diagnostics: {qa_result.summary}\n"
+            f"**Feature Worker Results:**\n- Status: {last_worker.status if last_worker else 'none'}\n- Modified Files: {accumulated_files}\n- Iterations: {len(all_worker_results)}\n- Summary: {last_worker.summary if last_worker else ''}\n\n"
+            f"**QA Verification:**\n- Status: {qa_result.status if qa_result else 'unknown'}\n- Diagnostics: {qa_result.summary if qa_result else ''}\n"
         )
+
+        # Record episodic reflection automatically in persistent memory
+        try:
+            from .tools import memory_store
+
+            memory_store.record_episodic_reflection(
+                goal=goal,
+                summary=final_summary,
+                files_modified=accumulated_files,
+            )
+        except Exception:
+            pass
 
         return TeamWorkflowResult(
             goal=goal,
             plan=plan,
-            worker_results=[worker_result],
+            worker_results=all_worker_results,
             qa_result=qa_result,
             status=overall_status,
             summary=final_summary,

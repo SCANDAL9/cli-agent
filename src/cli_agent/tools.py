@@ -3,15 +3,19 @@ Local system and memory tools for the Gemini agent.
 Enables file reading, directory exploration, code searching, and persistent SQLite memories.
 """
 
+import contextvars
 import os
 import re
+import signal
 import subprocess
+import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .code_graph import CodeGraphIndexer, CodeGraphStore
+from .code_graph import SUPPORTED_EXTENSIONS, CodeGraphIndexer, CodeGraphStore
 from .memory import MemoryStore, resolve_project_key
 
 memory_store = MemoryStore()
@@ -19,6 +23,22 @@ code_graph_store = CodeGraphStore()
 code_graph_indexer = CodeGraphIndexer(code_graph_store)
 
 _active_sandbox_dir: Path | None = None
+_allowed_write_paths_var: contextvars.ContextVar[set[Path] | None] = contextvars.ContextVar(
+    "_allowed_write_paths_var", default=None
+)
+
+
+@dataclass
+class BackgroundProcessEntry:
+    job_id: str
+    command: str
+    cwd: Path
+    process: subprocess.Popen[str]
+    log_path: Path
+    started_at: float
+
+
+_background_processes: dict[str, BackgroundProcessEntry] = {}
 
 
 def set_memory_store(store: MemoryStore) -> None:
@@ -43,6 +63,36 @@ def set_active_sandbox(sandbox_dir: Path | str | None) -> None:
 def get_active_sandbox() -> Path | None:
     """Returns the current active sandbox directory, or None if in direct workspace mode."""
     return _active_sandbox_dir
+
+
+def set_allowed_write_paths(paths: list[str | Path] | None) -> contextvars.Token[set[Path] | None]:
+    """Sets the context-local allowed write paths for scoped workers."""
+    if paths is None:
+        return _allowed_write_paths_var.set(None)
+    resolved_set = {_resolve_tool_path(str(p)) for p in paths if str(p).strip()}
+    return _allowed_write_paths_var.set(resolved_set)
+
+
+def reset_allowed_write_paths(token: contextvars.Token[set[Path] | None]) -> None:
+    """Resets the context-local allowed write paths."""
+    _allowed_write_paths_var.reset(token)
+
+
+def get_allowed_write_paths() -> set[Path] | None:
+    """Returns the active context-local allowed write paths, or None if unrestricted."""
+    return _allowed_write_paths_var.get()
+
+
+def _check_write_allowed(resolved_path: Path) -> str | None:
+    """Returns an error message if resolved_path violates active allowed_write_paths."""
+    allowed = _allowed_write_paths_var.get()
+    if allowed is not None and len(allowed) > 0 and resolved_path not in allowed:
+        allowed_strs = sorted(str(p) for p in allowed)
+        return (
+            f"Access denied: Modifying '{resolved_path}' is outside your approved file scope. "
+            f"Allowed files: {allowed_strs}"
+        )
+    return None
 
 
 def _resolve_tool_path(raw_path: str) -> Path:
@@ -222,13 +272,16 @@ def write_file(path: str, content: str, overwrite: bool = False) -> dict[str, An
     """Writes full content to a file, creating parent directories if necessary."""
     try:
         resolved = _resolve_tool_path(path)
+        err = _check_write_allowed(resolved)
+        if err:
+            return {"error": err}
         if resolved.exists() and not overwrite:
             return {"error": f"File '{path}' already exists. Pass overwrite=True to replace it."}
 
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
 
-        if resolved.suffix == ".py":
+        if resolved.suffix in SUPPORTED_EXTENSIONS:
             try:
                 code_graph_indexer.index_file(resolved)
             except Exception:
@@ -248,6 +301,9 @@ def edit_file(path: str, target: str, replacement: str) -> dict[str, Any]:
     """Replaces a unique occurrence of target string with replacement, with whitespace-normalized fallback."""
     try:
         resolved = _resolve_tool_path(path)
+        err = _check_write_allowed(resolved)
+        if err:
+            return {"error": err}
         if not resolved.is_file():
             return {"error": f"Path '{path}' is not an existing file."}
 
@@ -316,7 +372,7 @@ def edit_file(path: str, target: str, replacement: str) -> dict[str, Any]:
 
         resolved.write_text(new_content, encoding="utf-8")
 
-        if resolved.suffix == ".py":
+        if resolved.suffix in SUPPORTED_EXTENSIONS:
             try:
                 code_graph_indexer.index_file(resolved)
             except Exception:
@@ -454,15 +510,28 @@ def _window_command_output(
     return windowed, True
 
 
+def _build_safe_env() -> dict[str, str]:
+    """Constructs a sanitized environment dictionary for subprocess execution."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
 def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60) -> dict[str, Any]:
     """Executes a bash shell command with head-tail output windowing, secret redaction, and timeout protections."""
     try:
         default_dir = _active_sandbox_dir or Path.cwd().resolve()
-        work_dir = Path(cwd).expanduser().resolve() if cwd else default_dir
+        work_dir = _resolve_tool_path(cwd) if cwd else default_dir
+        if _active_sandbox_dir and not str(work_dir).startswith(str(_active_sandbox_dir)):
+            return {
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{_active_sandbox_dir}'."
+            }
         proc = subprocess.run(
             command,
             shell=True,
             cwd=work_dir,
+            env=_build_safe_env(),
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -483,6 +552,113 @@ def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60)
         return {"error": f"Command timed out after {timeout_seconds} seconds."}
     except Exception as e:
         return {"error": f"Command execution failed: {str(e)}"}
+
+
+def start_background_process(command: str, cwd: str | None = None) -> dict[str, Any]:
+    """Spawns a non-blocking background process (e.g., dev server, watcher) and streams output to a log file."""
+    try:
+        default_dir = _active_sandbox_dir or Path.cwd().resolve()
+        work_dir = _resolve_tool_path(cwd) if cwd else default_dir
+        if _active_sandbox_dir and not str(work_dir).startswith(str(_active_sandbox_dir)):
+            return {
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{_active_sandbox_dir}'."
+            }
+
+        job_id = f"bg-{uuid.uuid4().hex[:8]}"
+        log_dir = Path("/tmp/cli-agent/bg_logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{job_id}.log"
+
+        log_file = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=work_dir,
+            env=_build_safe_env(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        entry = BackgroundProcessEntry(
+            job_id=job_id,
+            command=command,
+            cwd=work_dir,
+            process=proc,
+            log_path=log_path,
+            started_at=time.time(),
+        )
+        _background_processes[job_id] = entry
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "pid": proc.pid,
+            "command": command,
+            "cwd": str(work_dir),
+            "log_path": str(log_path),
+        }
+    except Exception as e:
+        return {"error": f"Failed starting background process: {str(e)}"}
+
+
+def check_background_process(job_id: str, tail_lines: int = 100) -> dict[str, Any]:
+    """Checks the status and recent stdout/stderr logs of a background process."""
+    entry = _background_processes.get(job_id)
+    if not entry:
+        return {"error": f"Background job '{job_id}' not found."}
+
+    ret_code = entry.process.poll()
+    running = ret_code is None
+    raw_logs = ""
+    if entry.log_path.exists():
+        try:
+            lines = entry.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_logs = "\n".join(lines[-max(1, tail_lines) :])
+        except Exception:
+            raw_logs = ""
+
+    redacted_logs = _redact_secrets(raw_logs)
+    windowed_logs, truncated = _window_command_output(redacted_logs)
+
+    return {
+        "job_id": job_id,
+        "pid": entry.process.pid,
+        "command": entry.command,
+        "status": "running" if running else "exited",
+        "exit_code": ret_code,
+        "uptime_seconds": round(time.time() - entry.started_at, 2),
+        "logs": windowed_logs,
+        "truncated": truncated,
+    }
+
+
+def stop_background_process(job_id: str) -> dict[str, Any]:
+    """Terminates a running background process group cleanly."""
+    entry = _background_processes.get(job_id)
+    if not entry:
+        return {"error": f"Background job '{job_id}' not found."}
+
+    ret_code = entry.process.poll()
+    if ret_code is None:
+        try:
+            os.killpg(os.getpgid(entry.process.pid), signal.SIGTERM)
+            try:
+                entry.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(entry.process.pid), signal.SIGKILL)
+                entry.process.wait(timeout=2)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            entry.process.terminate()
+
+    final_code = entry.process.poll()
+    return {
+        "status": "stopped",
+        "job_id": job_id,
+        "pid": entry.process.pid,
+        "exit_code": final_code,
+    }
 
 
 async def delegate_task(
@@ -530,6 +706,9 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "write_file": write_file,
     "edit_file": edit_file,
     "run_command": run_command,
+    "start_background_process": start_background_process,
+    "check_background_process": check_background_process,
+    "stop_background_process": stop_background_process,
     "get_symbol_outline": get_symbol_outline,
     "find_symbol_definition": find_symbol_definition,
     "find_symbol_references": find_symbol_references,
@@ -804,6 +983,41 @@ GEMINI_TOOLS_DECLARATIONS = [
                 },
             },
             "required": ["role", "objective"],
+        },
+    },
+    {
+        "name": "start_background_process",
+        "description": "Starts a non-blocking background process (such as a dev server or watcher) and returns its job_id.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "command": {"type": "STRING", "description": "Shell command to run in the background."},
+                "cwd": {"type": "STRING", "description": "Optional working directory."},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "check_background_process",
+        "description": "Checks status and recent stdout/stderr logs of a running or exited background process.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "job_id": {"type": "STRING", "description": "Background job ID returned by start_background_process."},
+                "tail_lines": {"type": "INTEGER", "description": "Number of recent log lines to fetch (default: 100)."},
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "stop_background_process",
+        "description": "Stops and cleans up a background process by its job_id.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "job_id": {"type": "STRING", "description": "Background job ID to terminate."},
+            },
+            "required": ["job_id"],
         },
     },
 ]

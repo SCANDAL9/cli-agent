@@ -59,13 +59,14 @@ class SecurityPolicy:
             "analyze_symbol_impact",
             "search_memory",
             "save_memory",
+            "check_background_process",
         }:
             return RiskLevel.SAFE
 
-        if tool_name in {"write_file", "edit_file"}:
+        if tool_name in {"write_file", "edit_file", "stop_background_process"}:
             return RiskLevel.MEDIUM
 
-        if tool_name == "run_command":
+        if tool_name in {"run_command", "start_background_process"}:
             cmd = arguments.get("command", "")
             for pattern in COMPILED_HIGH_RISK:
                 if pattern.search(cmd):
