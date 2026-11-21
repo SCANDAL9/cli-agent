@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .code_graph import EXCLUDED_DIRS, PY_LANGUAGE
+from .code_graph import EXCLUDED_DIRS, PY_LANGUAGE, SUPPORTED_EXTENSIONS, CodeGraphIndexer
 from .memory import DEFAULT_DB_PATH, resolve_project_key
 from .token_provider import TokenProvider
 
@@ -99,25 +99,62 @@ class EmbeddingProvider(ABC):
 
 class FastLocalEmbeddingProvider(EmbeddingProvider):
     """
-    Deterministic, zero-latency local embedding provider using hashed sub-word n-grams.
-    Ensures immediate offline operation and zero external API dependencies for testing.
+    Deterministic, zero-latency local semantic embedding provider using camelCase/snake_case
+    sub-word splitting, domain concept synonym expansion, and character n-gram projections.
+    Ensures strong semantic similarity offline and zero external API dependencies.
     """
+
+    _CONCEPT_CLUSTERS: tuple[set[str], ...] = (
+        {"auth", "authenticate", "authentication", "login", "credential", "credentials", "jwt", "token", "oauth", "password", "secret", "identity"},
+        {"billing", "payment", "pay", "card", "credit", "invoice", "transaction", "charge", "stripe"},
+        {"db", "database", "sql", "sqlite", "postgres", "query", "table", "cursor", "schema", "persist", "store"},
+        {"error", "exception", "fail", "failure", "bug", "crash", "traceback", "repair", "fix"},
+        {"async", "await", "concurrent", "parallel", "coroutine", "future", "task", "thread", "spawn"},
+        {"test", "pytest", "assert", "verify", "validation", "validate", "qa", "regression", "tdd"},
+        {"http", "request", "response", "client", "endpoint", "api", "rest", "webhook", "fetch"},
+        {"file", "path", "directory", "folder", "read", "write", "disk", "fs"},
+    )
 
     def __init__(self, dimensions: int = 64) -> None:
         self.dimensions = dimensions
 
+    @classmethod
+    def _expand_tokens(cls, raw_text: str) -> list[tuple[str, float]]:
+        # Split camelCase and PascalCase before lowercasing
+        split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw_text)
+        raw_tokens = re.findall(r"[a-zA-Z0-9]+", split_camel.lower())
+        if not raw_tokens:
+            return []
+
+        weighted: list[tuple[str, float]] = []
+        token_set = set(raw_tokens)
+
+        for tok in raw_tokens:
+            weight = 1.0 + (len(tok) / 10.0)
+            weighted.append((tok, weight))
+            # Add character 3-gram stems for morphological similarity
+            if len(tok) >= 5:
+                weighted.append((f"stem:{tok[:4]}", 0.5))
+
+        # Inject domain concept cluster anchors when any synonym in the cluster appears
+        for cluster_idx, cluster in enumerate(cls._CONCEPT_CLUSTERS):
+            if token_set & cluster:
+                weighted.append((f"concept_cluster_{cluster_idx}", 2.2))
+
+        return weighted
+
     def _hash_embed(self, text: str) -> list[float]:
         vec = [0.0] * self.dimensions
-        tokens = re.findall(r"\w+", text.lower())
-        if not tokens:
+        weighted_tokens = self._expand_tokens(text)
+        if not weighted_tokens:
             return vec
 
-        for token in tokens:
-            # Hash token into dimension buckets
+        for token, weight in weighted_tokens:
             h = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
             idx = h % self.dimensions
-            weight = 1.0 + (len(token) / 10.0)
-            vec[idx] += weight
+            sign = 1.0 if ((h >> 8) & 1) == 0 else -1.0
+            # Keep positive bucket accumulation when dimensions are small for cosine stability
+            vec[idx] += weight if sign > 0 else weight * 0.85
 
         # Normalize to unit length
         norm = math.sqrt(sum(x * x for x in vec))
@@ -274,10 +311,44 @@ class CodeChunker:
 
         return chunks
 
+    @classmethod
+    def chunk_file(cls, path: Path, project_key: str) -> list[CodeChunk]:
+        """Chunks any supported source file (.py, .ts, .tsx, .js, .jsx, .go, .rs)."""
+        if path.suffix == ".py":
+            return cls.chunk_python_file(path, project_key)
+        if path.suffix not in SUPPORTED_EXTENSIONS:
+            return []
+
+        chunks: list[CodeChunk] = []
+        try:
+            code_str = path.read_text(encoding="utf-8", errors="replace")
+            lines = code_str.splitlines()
+        except Exception:
+            return chunks
+
+        indexer = CodeGraphIndexer()
+        symbols_with_edges = indexer.parse_polyglot_source(
+            code_str, str(path), project_key, path.suffix
+        )
+        for sym, _ in symbols_with_edges:
+            chunk_content = "\n".join(lines[max(0, sym.start_line - 1) : sym.end_line])
+            chunks.append(
+                CodeChunk(
+                    file_path=str(path),
+                    symbol_name=sym.symbol_name,
+                    symbol_type=sym.symbol_type,
+                    start_line=sym.start_line,
+                    end_line=sym.end_line,
+                    content=chunk_content,
+                    project_key=project_key,
+                )
+            )
+        return chunks
+
 
 class HybridSearchEngine:
     """
-    Coordinates AST chunk indexing, SQLite FTS5 BM25 queries, dense vector scoring,
+    Coordinates AST chunk indexing, SQLite FTS5 BM25 queries, in-memory cached dense vector scoring,
     and Reciprocal Rank Fusion (RRF).
     """
 
@@ -288,6 +359,7 @@ class HybridSearchEngine:
     ) -> None:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.embedding_provider = embedding_provider or FastLocalEmbeddingProvider()
+        self._vector_cache: dict[str, list[tuple[int, list[float]]]] = {}
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:

@@ -130,6 +130,28 @@ class TestMultiAgentTeamWorkflow:
         assert "Phase 2: Feature Worker" in "\n".join(events)
         assert "Phase 3: Independent QA" in "\n".join(events)
 
+    async def test_run_workflow_qa_feedback_and_heal(self, mock_client: AsyncMock) -> None:
+        team = MultiAgentTeam(client=mock_client)
+        # Round 1 QA fails, Round 2 QA passes
+        mock_client.chat.side_effect = [
+            "Architect Plan",  # Architect
+            "Round 1 Worker edit",  # Worker r1
+            "FAIL: AssertionError in test_auth.py",  # QA r1 (fails)
+            "Round 2 Worker fix",  # Worker r2
+            "PASS: All 12 tests passed",  # QA r2 (passes)
+        ]
+        events: list[str] = []
+
+        def on_event(etype: str, msg: str) -> None:
+            events.append(f"{etype}:{msg}")
+
+        result = await team.run_workflow("Refactor auth", max_feedback_rounds=2, on_event=on_event)
+
+        assert result.status == "success"
+        assert len(result.worker_results) == 2
+        assert any("qa_feedback" in e for e in events)
+        assert any("qa_pass" in e for e in events)
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio

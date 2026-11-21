@@ -32,6 +32,9 @@ class TestModelCatalogFiltering:
         assert detect_publisher("publishers/openai/models/gpt-4o") == "openai"
         assert detect_publisher("gemini-3.8-flash") == "google"
         assert detect_publisher("publishers/google/models/gemini-4-argon") == "google"
+        assert detect_publisher("publishers/google/models/gemini-4-hydrogen") == "google"
+        assert detect_publisher("publishers/google/models/gemini-4-neon") == "google"
+        assert detect_publisher("publishers/google/models/gemini-4-carbon") == "google"
 
     def test_is_viable_coding_model_valid(self) -> None:
         assert is_viable_coding_model("publishers/google/models/gemini-3.8-flash") is True
@@ -182,6 +185,19 @@ class TestVertexClientModelSwitching:
         client.switch_model("codestral-2")
         assert client.publisher == "mistralai"
         assert "publishers/mistralai/models/codestral-2:rawPredict" in client.endpoint
+
+        # Switch to Gemini 4 models
+        client.switch_model("gemini-4-hydrogen")
+        assert client.publisher == "google"
+        assert "publishers/google/models/gemini-4-hydrogen:generateContent" in client.endpoint
+
+        client.switch_model("gemini-4-neon")
+        assert client.publisher == "google"
+        assert "publishers/google/models/gemini-4-neon:generateContent" in client.endpoint
+
+        client.switch_model("gemini-4-carbon")
+        assert client.publisher == "google"
+        assert "publishers/google/models/gemini-4-carbon:generateContent" in client.endpoint
 
 
 @pytest.mark.unit

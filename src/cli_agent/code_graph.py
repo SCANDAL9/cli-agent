@@ -5,6 +5,7 @@ Extracts symbols (classes, functions, methods), signatures, docstrings, and rela
 """
 
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ from tree_sitter import Language, Node, Parser
 from .memory import DEFAULT_DB_PATH, resolve_project_key
 
 PY_LANGUAGE = Language(tspython.language())
+
+SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"}
 
 
 def _node_text(node: Node | None) -> str:
@@ -543,10 +546,319 @@ class CodeGraphIndexer:
 
         return results
 
+    def parse_polyglot_source(
+        self, code: str, file_path: str, project_key: str, suffix: str
+    ) -> list[tuple[CodeSymbol, list[SymbolEdge]]]:
+        """
+        Parses TypeScript/JavaScript (.ts, .tsx, .js, .jsx), Go (.go), and Rust (.rs)
+        source files into structural symbols (classes, structs, interfaces, functions, methods)
+        and dependency edges (calls, inherits, imports).
+        """
+        results: list[tuple[CodeSymbol, list[SymbolEdge]]] = []
+        lines = code.splitlines()
+        total_lines = len(lines)
+        if total_lines == 0:
+            return results
+
+        def _find_block_end(start_idx: int) -> int:
+            depth = 0
+            opened = False
+            for idx in range(start_idx, total_lines):
+                for ch in lines[idx]:
+                    if ch == "{":
+                        depth += 1
+                        opened = True
+                    elif ch == "}":
+                        depth -= 1
+                        if opened and depth <= 0:
+                            return idx + 1
+            return min(total_lines, start_idx + 1)
+
+        def _extract_leading_comment(line_idx: int) -> str:
+            doc_lines: list[str] = []
+            idx = line_idx - 1
+            while idx >= 0:
+                stripped = lines[idx].strip()
+                if stripped.startswith(("//", "///", "*", "/**", "*/")):
+                    cleaned = re.sub(r"^(/+\**|\*+/|\*+)\s*", "", stripped).strip()
+                    if cleaned:
+                        doc_lines.insert(0, cleaned)
+                    idx -= 1
+                else:
+                    break
+            return " ".join(doc_lines)
+
+        def _extract_body_calls(start_line: int, end_line: int, own_name: str) -> list[SymbolEdge]:
+            body_text = "\n".join(lines[max(0, start_line - 1) : min(total_lines, end_line)])
+            call_matches = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", body_text)
+            keywords = {
+                "if",
+                "for",
+                "while",
+                "switch",
+                "catch",
+                "return",
+                "function",
+                "func",
+                "fn",
+                "match",
+                "sizeof",
+                "new",
+                "super",
+                own_name,
+            }
+            edges: list[SymbolEdge] = []
+            seen: set[str] = set()
+            for target in call_matches:
+                if target not in keywords and target not in seen:
+                    seen.add(target)
+                    edges.append(SymbolEdge(target_symbol_name=target, relationship_type="calls"))
+            return edges
+
+        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            class_re = re.compile(
+                r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(class|interface)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:extends|implements)\s+([A-Za-z0-9_,\s<>]+))?"
+            )
+            func_re = re.compile(
+                r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)(?:\s*:\s*([^{]+))?"
+            )
+            arrow_re = re.compile(
+                r"^\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*(?::\s*([^=]+))?=>"
+            )
+            method_re = re.compile(
+                r"^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)(?:\s*:\s*([^{]+))?\s*\{"
+            )
+
+            current_class: tuple[str, int] | None = None
+            for i, line in enumerate(lines):
+                line_no = i + 1
+                if current_class and line_no > current_class[1]:
+                    current_class = None
+
+                cm = class_re.match(line)
+                if cm:
+                    kind, cname, bases = cm.group(1), cm.group(2), cm.group(3)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    edges: list[SymbolEdge] = []
+                    if bases:
+                        for b in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", bases):
+                            edges.append(SymbolEdge(target_symbol_name=b, relationship_type="inherits"))
+                    sig = line.strip().rstrip("{").strip()
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=cname,
+                                symbol_type="class",
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            edges,
+                        )
+                    )
+                    if kind == "class":
+                        current_class = (cname, end_l)
+                    continue
+
+                fm = func_re.match(line) or arrow_re.match(line)
+                if fm:
+                    fname = fm.group(1)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    sig = line.strip().rstrip("{").strip()
+                    fedges = _extract_body_calls(line_no, end_l, fname)
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=fname,
+                                symbol_type="function",
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            fedges,
+                        )
+                    )
+                    continue
+
+                if current_class:
+                    mm = method_re.match(line)
+                    if mm:
+                        mname = mm.group(1)
+                        if mname not in {"if", "for", "while", "switch", "catch"}:
+                            end_l = _find_block_end(i)
+                            doc = _extract_leading_comment(i)
+                            sig = line.strip().rstrip("{").strip()
+                            medges = _extract_body_calls(line_no, end_l, mname)
+                            results.append(
+                                (
+                                    CodeSymbol(
+                                        symbol_name=f"{current_class[0]}.{mname}",
+                                        symbol_type="method",
+                                        start_line=line_no,
+                                        end_line=end_l,
+                                        signature=sig,
+                                        docstring=doc,
+                                        file_path=file_path,
+                                        project_key=project_key,
+                                    ),
+                                    medges,
+                                )
+                            )
+
+        elif suffix == ".go":
+            type_re = re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(struct|interface)\b")
+            func_re = re.compile(
+                r"^\s*func\s+(?:\(\s*\w+\s+\*?([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("
+            )
+            for i, line in enumerate(lines):
+                line_no = i + 1
+                tm = type_re.match(line)
+                if tm:
+                    tname = tm.group(1)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    sig = line.strip().rstrip("{").strip()
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=tname,
+                                symbol_type="class",
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            [],
+                        )
+                    )
+                    continue
+                fm = func_re.match(line)
+                if fm:
+                    recv, fname = fm.group(1), fm.group(2)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    sig = line.strip().rstrip("{").strip()
+                    fedges = _extract_body_calls(line_no, end_l, fname)
+                    sym_name = f"{recv}.{fname}" if recv else fname
+                    sym_type = "method" if recv else "function"
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=sym_name,
+                                symbol_type=sym_type,
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            fedges,
+                        )
+                    )
+
+        elif suffix == ".rs":
+            type_re = re.compile(
+                r"^\s*(?:pub(?:\([^)]*\))?\s+)?(struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)"
+            )
+            impl_re = re.compile(
+                r"^\s*impl(?:<[^>]*>)?\s+(?:([A-Za-z_][A-Za-z0-9_]*)\s+for\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+            )
+            fn_re = re.compile(
+                r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"
+            )
+            current_impl: tuple[str, int] | None = None
+            for i, line in enumerate(lines):
+                line_no = i + 1
+                if current_impl and line_no > current_impl[1]:
+                    current_impl = None
+
+                tm = type_re.match(line)
+                if tm:
+                    tname = tm.group(2)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    sig = line.strip().rstrip("{").strip()
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=tname,
+                                symbol_type="class",
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            [],
+                        )
+                    )
+                    continue
+
+                im = impl_re.match(line)
+                if im:
+                    trait_name, struct_name = im.group(1), im.group(2)
+                    end_l = _find_block_end(i)
+                    current_impl = (struct_name, end_l)
+                    if trait_name:
+                        results.append(
+                            (
+                                CodeSymbol(
+                                    symbol_name=struct_name,
+                                    symbol_type="class",
+                                    start_line=line_no,
+                                    end_line=end_l,
+                                    signature=line.strip().rstrip("{").strip(),
+                                    file_path=file_path,
+                                    project_key=project_key,
+                                ),
+                                [SymbolEdge(target_symbol_name=trait_name, relationship_type="inherits")],
+                            )
+                        )
+                    continue
+
+                fm = fn_re.match(line)
+                if fm:
+                    fname = fm.group(1)
+                    end_l = _find_block_end(i)
+                    doc = _extract_leading_comment(i)
+                    sig = line.strip().rstrip("{").strip()
+                    fedges = _extract_body_calls(line_no, end_l, fname)
+                    sym_name = f"{current_impl[0]}.{fname}" if current_impl else fname
+                    sym_type = "method" if current_impl else "function"
+                    results.append(
+                        (
+                            CodeSymbol(
+                                symbol_name=sym_name,
+                                symbol_type=sym_type,
+                                start_line=line_no,
+                                end_line=end_l,
+                                signature=sig,
+                                docstring=doc,
+                                file_path=file_path,
+                                project_key=project_key,
+                            ),
+                            fedges,
+                        )
+                    )
+
+        return results
+
     def index_file(self, file_path: Path | str, project_key: str | None = None) -> int:
-        """Indexes a single file into the code graph store."""
+        """Indexes a single source file (.py, .ts, .tsx, .js, .jsx, .go, .rs) into the code graph store."""
         path = Path(file_path).resolve()
-        if not path.is_file() or path.suffix != ".py":
+        if not path.is_file() or path.suffix not in SUPPORTED_EXTENSIONS:
             return 0
 
         p_key = project_key or resolve_project_key()
@@ -557,7 +869,10 @@ class CodeGraphIndexer:
             return 0
 
         rel_path = str(path)
-        symbols_with_edges = self.parse_python_source(content, rel_path, p_key)
+        if path.suffix == ".py":
+            symbols_with_edges = self.parse_python_source(content, rel_path, p_key)
+        else:
+            symbols_with_edges = self.parse_polyglot_source(content, rel_path, p_key, path.suffix)
         self.store.save_file_symbols(p_key, rel_path, symbols_with_edges, mtime=st_mtime)
         return len(symbols_with_edges)
 
@@ -567,7 +882,7 @@ class CodeGraphIndexer:
         project_key: str | None = None,
         max_files: int = 500,
     ) -> int:
-        """Recursively indexes all Python files under dir_path, skipping unchanged files via st_mtime."""
+        """Recursively indexes all supported source files under dir_path, skipping unchanged files via st_mtime."""
         root = Path(dir_path).resolve()
         if not root.is_dir():
             return 0
@@ -580,7 +895,7 @@ class CodeGraphIndexer:
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
 
             for file in files:
-                if file.endswith(".py"):
+                if Path(file).suffix in SUPPORTED_EXTENSIONS:
                     full_path = (Path(current_root) / file).resolve()
                     try:
                         current_mtime = full_path.stat().st_mtime

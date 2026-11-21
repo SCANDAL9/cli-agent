@@ -7,6 +7,7 @@ Phase 3: GREEN - Verify reproducing test passes.
 Phase 4: NO_REGRESSION - Run full regression test suite; rollback on regression.
 """
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -195,19 +196,27 @@ class AutonomousTDDEngine:
         cwd: Path | None = None,
         timeout: int | None = None,
     ) -> tuple[int, str, str]:
-        """Runs a shell command asynchronously and returns (exit_code, stdout, stderr)."""
+        """Runs a shell command asynchronously without blocking the event loop."""
         work_dir = cwd or self.config.working_directory or Path.cwd()
         t = timeout or self.config.timeout_seconds
 
-        proc = subprocess.run(
+        proc = await asyncio.create_subprocess_shell(
             command,
-            shell=True,
             cwd=work_dir,
-            capture_output=True,
-            text=True,
-            timeout=t,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=t)
+            return (
+                proc.returncode if proc.returncode is not None else 1,
+                stdout_bytes.decode("utf-8", errors="replace"),
+                stderr_bytes.decode("utf-8", errors="replace"),
+            )
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return 124, "", f"Command timed out after {t} seconds."
 
     def capture_git_diff(self, cwd: Path | None = None) -> str:
         """Captures unified git diff of current changes."""

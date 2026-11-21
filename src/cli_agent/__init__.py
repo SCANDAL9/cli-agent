@@ -39,6 +39,7 @@ from .pr import (
     detect_git_host_provider,
 )
 from .security import RiskLevel, SecurityPolicy
+from .session import SessionRecord, SessionStore, generate_session_id
 from .token_provider import TokenProvider
 from .tui import (
     ChatPane,
@@ -92,6 +93,8 @@ __all__ = [
     "RingBufferSubscription",
     "RiskLevel",
     "SecurityPolicy",
+    "SessionRecord",
+    "SessionStore",
     "StatusHUD",
     "SubprocLogPayload",
     "SwarmNodeStatePayload",
@@ -111,6 +114,7 @@ __all__ = [
     "detect_git_host_provider",
     "estimate_context_tokens",
     "extract_session_learnings",
+    "generate_session_id",
     "get_event_bus",
     "get_global_event_bus",
     "main",

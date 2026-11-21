@@ -226,3 +226,101 @@ class MemoryStore:
                     (limit,),
                 )
             return [dict(row) for row in cursor.fetchall()]
+
+    def consolidate_memories(self, project_key: str | None = None) -> int:
+        """
+        Deduplicates identical memory entries (same project_key, scope, type, title, content),
+        keeping only the most recent record (highest id). Returns number of pruned rows.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if project_key:
+                cursor.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE (project_key = ? OR scope = 'global')
+                      AND id NOT IN (
+                          SELECT MAX(id)
+                          FROM memories
+                          WHERE project_key = ? OR scope = 'global'
+                          GROUP BY project_key, scope, type, title, content
+                      )
+                    """,
+                    (project_key, project_key),
+                )
+            else:
+                cursor.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE id NOT IN (
+                        SELECT MAX(id)
+                        FROM memories
+                        GROUP BY project_key, scope, type, title, content
+                    )
+                    """
+                )
+            deleted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
+            conn.commit()
+            return deleted
+
+    def get_relevant_memories(
+        self,
+        query: str = "",
+        limit: int = 8,
+        project_key: str | None = None,
+        deduplicate: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieves contextually relevant memories combining FTS5 semantic/keyword matches
+        with recent memories, automatically deduplicating identical (type, title, content) tuples.
+        """
+        candidates: list[dict[str, Any]] = []
+        if query.strip():
+            candidates.extend(
+                self.search_memory(query=query, project_key=project_key, limit=limit)
+            )
+        candidates.extend(
+            self.get_recent_memories(limit=limit * 2, project_key=project_key)
+        )
+
+        if not deduplicate:
+            return candidates[:limit]
+
+        unique_results: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for mem in candidates:
+            dedup_key = (
+                str(mem.get("type", "")).strip().lower(),
+                str(mem.get("title", "")).strip().lower(),
+                str(mem.get("content", "")).strip(),
+            )
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                unique_results.append(mem)
+                if len(unique_results) >= limit:
+                    break
+        return unique_results
+
+    def record_episodic_reflection(
+        self,
+        goal: str,
+        summary: str,
+        files_modified: list[str] | None = None,
+        project_key: str | None = None,
+    ) -> int:
+        """
+        Automatically records an episodic memory reflection after a multi-step workflow or repair.
+        """
+        files_str = ", ".join(files_modified) if files_modified else "none"
+        short_goal = goal.strip().splitlines()[0][:80] if goal.strip() else "Autonomous Task"
+        title = f"Episodic Reflection: {short_goal}"
+        clean_summary = summary.strip()[:600]
+        content = f"Goal: {short_goal} | Modified: [{files_str}] | Outcome: {clean_summary}"
+        return self.save_memory(
+            title=title,
+            content=content,
+            memory_type="discovery",
+            project_key=project_key,
+            scope="project",
+        )
+

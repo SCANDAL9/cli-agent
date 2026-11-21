@@ -51,10 +51,18 @@ class VertexAgentClient:
         http_client: httpx.AsyncClient | None = None,
         fallback_router: FallbackRouter | None = None,
         circuit_breaker: QuotaCircuitBreaker | None = None,
+        timeout: float | httpx.Timeout | None = None,
     ):
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
+        self.timeout = (
+            timeout
+            if isinstance(timeout, httpx.Timeout)
+            else httpx.Timeout(float(timeout), connect=15.0)
+            if timeout is not None
+            else DEFAULT_TIMEOUT
+        )
         self.memory = memory_store or MemoryStore()
         set_memory_store(self.memory)
         self.code_graph_store = code_graph_store or CodeGraphStore()

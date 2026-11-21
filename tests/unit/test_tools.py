@@ -219,3 +219,54 @@ class TestToolsUnit:
         assert "[REDACTED_PRIVATE_KEY]" in sec_out
         assert "sk-1234567890abcdef12345678" not in sec_out
         assert "[REDACTED_SECRET]" in sec_out
+
+    def test_background_processes_lifecycle(self, tmp_path: Path):
+        # 1. Start background process with unbuffered output (-u)
+        start_res = execute_tool(
+            "start_background_process",
+            {"command": "python3 -u -c 'import time; print(\"server_started\", flush=True); time.sleep(10)'", "cwd": str(tmp_path)},
+        )
+        assert start_res.get("status") == "started"
+        job_id = start_res["job_id"]
+        assert job_id.startswith("bg-")
+
+        # 2. Check running process
+        import time
+        time.sleep(0.4)
+        check_res = execute_tool("check_background_process", {"job_id": job_id})
+        assert check_res.get("job_id") == job_id
+        assert check_res.get("status") == "running"
+        assert "server_started" in check_res.get("logs", "")
+
+        # 3. Stop background process
+        stop_res = execute_tool("stop_background_process", {"job_id": job_id})
+        assert stop_res.get("status") == "stopped"
+
+        # 4. Verify exited status
+        time.sleep(0.1)
+        post_check = execute_tool("check_background_process", {"job_id": job_id})
+        assert post_check.get("status") == "exited"
+
+    def test_allowed_write_paths_enforcement(self, tmp_path: Path):
+        from cli_agent.tools import reset_allowed_write_paths, set_allowed_write_paths
+
+        allowed_f = tmp_path / "allowed.py"
+        forbidden_f = tmp_path / "forbidden.py"
+
+        token = set_allowed_write_paths([str(allowed_f)])
+        try:
+            # Writing to allowed file succeeds
+            ok_res = write_file(str(allowed_f), "x = 1")
+            assert ok_res.get("status") == "success"
+
+            # Writing to forbidden file blocked
+            blocked_res = write_file(str(forbidden_f), "y = 2")
+            assert "Access denied" in blocked_res.get("error", "")
+
+            # Editing forbidden file blocked
+            forbidden_f.write_text("orig = 1", encoding="utf-8")
+            blocked_edit = edit_file(str(forbidden_f), target="orig", replacement="new")
+            assert "Access denied" in blocked_edit.get("error", "")
+        finally:
+            reset_allowed_write_paths(token)
+
