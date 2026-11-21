@@ -64,15 +64,39 @@ BASELINE_CATALOG: list[ModelCatalogEntry] = [
         launch_stage="GA",
     ),
     ModelCatalogEntry(
-        model_id="publishers/google/models/gemini-3.7-flash",
+        model_id="publishers/google/models/gemini-3.1-pro",
         publisher="google",
-        short_name="gemini-3.7-flash",
+        short_name="gemini-3.1-pro",
         launch_stage="GA",
+    ),
+    ModelCatalogEntry(
+        model_id="publishers/google/models/gemini-4-hydrogen",
+        publisher="google",
+        short_name="gemini-4-hydrogen",
+        launch_stage="PREVIEW",
+    ),
+    ModelCatalogEntry(
+        model_id="publishers/google/models/gemini-4-neon",
+        publisher="google",
+        short_name="gemini-4-neon",
+        launch_stage="PREVIEW",
+    ),
+    ModelCatalogEntry(
+        model_id="publishers/google/models/gemini-4-carbon",
+        publisher="google",
+        short_name="gemini-4-carbon",
+        launch_stage="PREVIEW",
     ),
     ModelCatalogEntry(
         model_id="publishers/google/models/gemini-4-argon",
         publisher="google",
         short_name="gemini-4-argon",
+        launch_stage="GA",
+    ),
+    ModelCatalogEntry(
+        model_id="publishers/google/models/gemini-3.7-flash",
+        publisher="google",
+        short_name="gemini-3.7-flash",
         launch_stage="GA",
     ),
     ModelCatalogEntry(
