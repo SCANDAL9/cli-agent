@@ -8,9 +8,12 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,7 +25,11 @@ memory_store = MemoryStore()
 code_graph_store = CodeGraphStore()
 code_graph_indexer = CodeGraphIndexer(code_graph_store)
 
-_active_sandbox_dir: Path | None = None
+_active_sandbox_var: ContextVar[Path | None] = ContextVar("_active_sandbox_var", default=None)
+_allowed_files_var: ContextVar[frozenset[str] | None] = ContextVar(
+    "_allowed_files_var", default=None
+)
+_active_worker_id_var: ContextVar[str | None] = ContextVar("_active_worker_id_var", default=None)
 _allowed_write_paths_var: contextvars.ContextVar[set[Path] | None] = contextvars.ContextVar(
     "_allowed_write_paths_var", default=None
 )
@@ -41,6 +48,55 @@ class BackgroundProcessEntry:
 _background_processes: dict[str, BackgroundProcessEntry] = {}
 
 
+class ToolScopeViolationError(PermissionError):
+    """Raised when a scoped worker attempts to mutate a file outside its allowed_files ACL."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        violation_type: str = "ALLOWED_FILES_ACL_VIOLATION",
+        attempted_path: str = "",
+        allowed_files: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.violation_type = violation_type
+        self.attempted_path = attempted_path
+        self.allowed_files: list[str] = allowed_files if allowed_files is not None else []
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializes the violation into a structured tool response dictionary."""
+        return {
+            "error": str(self),
+            "violation_type": self.violation_type,
+            "attempted_path": self.attempted_path,
+            "allowed_files": self.allowed_files,
+        }
+
+
+@contextmanager
+def worker_execution_scope(
+    sandbox_dir: Path | None,
+    allowed_files: list[str] | None = None,
+    worker_id: str | None = None,
+) -> Iterator[None]:
+    """Binds a coroutine-local Git worktree sandbox and hard allowed_files ACL."""
+    resolved_sandbox = sandbox_dir.resolve() if sandbox_dir else None
+    normalized_allowed: frozenset[str] | None = None
+    if allowed_files is not None:
+        normalized_allowed = frozenset(Path(f).as_posix().lstrip("./") for f in allowed_files)
+
+    tok_sandbox = _active_sandbox_var.set(resolved_sandbox)
+    tok_allowed = _allowed_files_var.set(normalized_allowed)
+    tok_worker = _active_worker_id_var.set(worker_id)
+    try:
+        yield
+    finally:
+        _active_sandbox_var.reset(tok_sandbox)
+        _allowed_files_var.reset(tok_allowed)
+        _active_worker_id_var.reset(tok_worker)
+
+
 def set_memory_store(store: MemoryStore) -> None:
     """Configures the active MemoryStore instance used by memory tools."""
     global memory_store
@@ -56,13 +112,13 @@ def set_code_graph_store(store: CodeGraphStore) -> None:
 
 def set_active_sandbox(sandbox_dir: Path | str | None) -> None:
     """Sets or clears the active ephemeral sandbox directory for file and command operations."""
-    global _active_sandbox_dir
-    _active_sandbox_dir = Path(sandbox_dir).resolve() if sandbox_dir else None
+    resolved = Path(sandbox_dir).resolve() if sandbox_dir else None
+    _active_sandbox_var.set(resolved)
 
 
 def get_active_sandbox() -> Path | None:
     """Returns the current active sandbox directory, or None if in direct workspace mode."""
-    return _active_sandbox_dir
+    return _active_sandbox_var.get()
 
 
 def set_allowed_write_paths(paths: list[str | Path] | None) -> contextvars.Token[set[Path] | None]:
@@ -98,15 +154,62 @@ def _check_write_allowed(resolved_path: Path) -> str | None:
 def _resolve_tool_path(raw_path: str) -> Path:
     """Resolves a path, remapping relative or workspace paths into the active sandbox when enabled."""
     p = Path(raw_path).expanduser()
-    if _active_sandbox_dir:
+    active_sandbox = _active_sandbox_var.get()
+    if active_sandbox:
         if not p.is_absolute():
-            return (_active_sandbox_dir / p).resolve()
+            return (active_sandbox / p).resolve()
         try:
-            rel = p.relative_to(Path.cwd().resolve())
-            return (_active_sandbox_dir / rel).resolve()
+            p.resolve().relative_to(active_sandbox.resolve())
+            return p.resolve()
+        except ValueError:
+            pass
+        try:
+            rel = p.resolve().relative_to(Path.cwd().resolve())
+            return (active_sandbox / rel).resolve()
         except ValueError:
             return p.resolve()
     return p.resolve()
+
+
+def _enforce_write_scope(raw_path: str, resolved_path: Path) -> None:
+    """Verifies that resolved_path is inside the active sandbox and matches allowed_files."""
+    sandbox_root = _active_sandbox_var.get()
+    allowed_set = _allowed_files_var.get()
+    worker_id = _active_worker_id_var.get()
+    base_root = sandbox_root.resolve() if sandbox_root is not None else Path.cwd().resolve()
+
+    resolved_target = resolved_path.resolve()
+    is_scoped = sandbox_root is not None or allowed_set is not None or worker_id is not None
+
+    # 1. Path Traversal Guard (Prevent '../../etc/passwd' or symlink escape)
+    try:
+        rel_posix = resolved_target.relative_to(base_root).as_posix()
+    except ValueError as exc:
+        if not is_scoped and ".." not in Path(raw_path).parts:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            try:
+                resolved_target.relative_to(temp_root)
+                return
+            except ValueError:
+                pass
+        raise ToolScopeViolationError(
+            f"Security Violation: Path '{raw_path}' escapes workspace root '{base_root}'.",
+            violation_type="PATH_TRAVERSAL_VIOLATION",
+            attempted_path=raw_path,
+            allowed_files=sorted(allowed_set) if allowed_set is not None else [],
+        ) from exc
+
+    # 2. Hard allowed_files ACL Guard
+    if allowed_set is not None and rel_posix not in allowed_set:
+        effective_worker = worker_id or "scoped-worker"
+        allowed_list = ", ".join(sorted(allowed_set)) or "<none (read-only)>"
+        raise ToolScopeViolationError(
+            f"Access Denied for worker [{effective_worker}]: Attempted to modify '{rel_posix}', "
+            f"which is outside approved allowed_files: [{allowed_list}].",
+            violation_type="ALLOWED_FILES_ACL_VIOLATION",
+            attempted_path=rel_posix,
+            allowed_files=sorted(allowed_set),
+        )
 
 
 def read_file(path: str, start_line: int = 1, end_line: int = 300) -> dict[str, Any]:
@@ -275,6 +378,7 @@ def write_file(path: str, content: str, overwrite: bool = False) -> dict[str, An
         err = _check_write_allowed(resolved)
         if err:
             return {"error": err}
+        _enforce_write_scope(path, resolved)
         if resolved.exists() and not overwrite:
             return {"error": f"File '{path}' already exists. Pass overwrite=True to replace it."}
 
@@ -287,12 +391,36 @@ def write_file(path: str, content: str, overwrite: bool = False) -> dict[str, An
             except Exception:
                 pass
 
-        return {
+        resp: dict[str, Any] = {
             "status": "success",
             "path": str(resolved),
             "bytes_written": len(content.encode("utf-8")),
             "lines": len(content.splitlines()),
         }
+
+        # W5.3 Headless LSP diagnostic enrichment
+        if resolved.suffix == ".py":
+            try:
+                from .lsp import get_lsp_manager
+
+                lsp_mgr = get_lsp_manager()
+                lsp_report = lsp_mgr.check_file_sync(resolved, content, timeout_ms=50.0)
+                resp["lsp_status"] = "clean" if lsp_report.is_clean else "diagnostics_found"
+                resp["lsp_errors"] = lsp_report.error_count
+                resp["lsp_warnings"] = lsp_report.warning_count
+                resp["lsp_latency_ms"] = lsp_report.latency_ms
+                resp["lsp_diagnostics"] = [d.to_dict() for d in lsp_report.diagnostics[:20]]
+                if lsp_report.error_count > 0:
+                    resp["lsp_hint"] = (
+                        f"LSP detected {lsp_report.error_count} error(s) in '{path}'. "
+                        "Fix these line-level diagnostics immediately via edit_file before running pytest."
+                    )
+            except Exception:
+                pass
+
+        return resp
+    except ToolScopeViolationError as e:
+        return e.to_dict()
     except Exception as e:
         return {"error": f"Failed writing to '{path}': {str(e)}"}
 
@@ -304,6 +432,7 @@ def edit_file(path: str, target: str, replacement: str) -> dict[str, Any]:
         err = _check_write_allowed(resolved)
         if err:
             return {"error": err}
+        _enforce_write_scope(path, resolved)
         if not resolved.is_file():
             return {"error": f"Path '{path}' is not an existing file."}
 
@@ -378,11 +507,35 @@ def edit_file(path: str, target: str, replacement: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        return {
+        resp: dict[str, Any] = {
             "status": "success",
             "path": str(resolved),
             "replacements_made": 1,
         }
+
+        # W5.3 Headless LSP diagnostic enrichment
+        if resolved.suffix == ".py":
+            try:
+                from .lsp import get_lsp_manager
+
+                lsp_mgr = get_lsp_manager()
+                lsp_report = lsp_mgr.check_file_sync(resolved, new_content, timeout_ms=50.0)
+                resp["lsp_status"] = "clean" if lsp_report.is_clean else "diagnostics_found"
+                resp["lsp_errors"] = lsp_report.error_count
+                resp["lsp_warnings"] = lsp_report.warning_count
+                resp["lsp_latency_ms"] = lsp_report.latency_ms
+                resp["lsp_diagnostics"] = [d.to_dict() for d in lsp_report.diagnostics[:20]]
+                if lsp_report.error_count > 0:
+                    resp["lsp_hint"] = (
+                        f"LSP detected {lsp_report.error_count} error(s) in '{path}'. "
+                        "Fix these line-level diagnostics immediately via edit_file before running pytest."
+                    )
+            except Exception:
+                pass
+
+        return resp
+    except ToolScopeViolationError as e:
+        return e.to_dict()
     except Exception as e:
         return {"error": f"Failed editing '{path}': {str(e)}"}
 
@@ -521,11 +674,12 @@ def _build_safe_env() -> dict[str, str]:
 def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60) -> dict[str, Any]:
     """Executes a bash shell command with head-tail output windowing, secret redaction, and timeout protections."""
     try:
-        default_dir = _active_sandbox_dir or Path.cwd().resolve()
+        active_sandbox = _active_sandbox_var.get()
+        default_dir = active_sandbox or Path.cwd().resolve()
         work_dir = _resolve_tool_path(cwd) if cwd else default_dir
-        if _active_sandbox_dir and not str(work_dir).startswith(str(_active_sandbox_dir)):
+        if active_sandbox and not str(work_dir).startswith(str(active_sandbox)):
             return {
-                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{_active_sandbox_dir}'."
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'."
             }
         proc = subprocess.run(
             command,
@@ -557,11 +711,12 @@ def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60)
 def start_background_process(command: str, cwd: str | None = None) -> dict[str, Any]:
     """Spawns a non-blocking background process (e.g., dev server, watcher) and streams output to a log file."""
     try:
-        default_dir = _active_sandbox_dir or Path.cwd().resolve()
+        active_sandbox = _active_sandbox_var.get()
+        default_dir = active_sandbox or Path.cwd().resolve()
         work_dir = _resolve_tool_path(cwd) if cwd else default_dir
-        if _active_sandbox_dir and not str(work_dir).startswith(str(_active_sandbox_dir)):
+        if active_sandbox and not str(work_dir).startswith(str(active_sandbox)):
             return {
-                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{_active_sandbox_dir}'."
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'."
             }
 
         job_id = f"bg-{uuid.uuid4().hex[:8]}"
