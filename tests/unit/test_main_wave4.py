@@ -22,6 +22,7 @@ from cli_agent.memory import MemoryStore
 from cli_agent.models import ModelCatalogEntry
 from cli_agent.pr import CIStatus, CIWatcher, CIWatchResult, GitPlatform, PRMetadata, PRSynthesizer
 from cli_agent.security import RiskLevel
+from cli_agent.session import SessionStore
 from cli_agent.tui import TUIApp, TUILayoutManager
 from cli_agent.voice import VoiceAgentEngine
 
@@ -71,6 +72,10 @@ async def test_wave4_repl_commands_pr_tui_voice_doctor_help(tmp_path: Path) -> N
     inputs = [
         "",
         "/help",
+        "/auto",
+        "/auto on",
+        "/auto off",
+        "/auto invalid",
         "/doctor",
         "/pr",
         "/pr create",
@@ -129,6 +134,7 @@ async def test_wave4_repl_commands_pr_tui_voice_doctor_help(tmp_path: Path) -> N
     with (
         patch("cli_agent.main.PromptSession", return_value=mock_session),
         patch("cli_agent.main.MemoryStore", return_value=MemoryStore(db_path=tmp_path / "m.db")),
+        patch("cli_agent.main.SessionStore", return_value=SessionStore(db_path=tmp_path / "s1.db")),
         patch("cli_agent.main.CodeGraphIndexer") as mock_indexer_cls,
         patch("cli_agent.main.get_hybrid_search_engine") as mock_search_fn,
         patch("cli_agent.main.detect_git_host_provider", return_value=mock_provider),
@@ -164,6 +170,7 @@ async def test_run_interactive_max_turns_and_chat(tmp_path: Path) -> None:
     with (
         patch("cli_agent.main.PromptSession", return_value=mock_session),
         patch("cli_agent.main.MemoryStore", return_value=MemoryStore(db_path=tmp_path / "m2.db")),
+        patch("cli_agent.main.SessionStore", return_value=SessionStore(db_path=tmp_path / "s2.db")),
         patch("cli_agent.main.CodeGraphIndexer"),
         patch("cli_agent.main.get_hybrid_search_engine") as mock_search_fn,
         patch("cli_agent.main.VertexAgentClient") as mock_client_cls,
@@ -184,6 +191,7 @@ async def test_run_oneshot_success(tmp_path: Path) -> None:
 
     with (
         patch("cli_agent.main.MemoryStore", return_value=MemoryStore(db_path=tmp_path / "o.db")),
+        patch("cli_agent.main.SessionStore", return_value=SessionStore(db_path=tmp_path / "s3.db")),
         patch("cli_agent.main.VertexAgentClient") as mock_client_cls,
     ):
         mock_client_cls.return_value.stream_chat = fake_stream
@@ -266,3 +274,28 @@ async def test_direct_wave4_helpers_tui_voice_pr(tmp_path: Path) -> None:
     watcher = CIWatcher(provider=provider, poll_interval_seconds=0.01, sleep_fn=lambda _: None)
     watch_res = watcher.watch()
     assert watch_res.final_status == CIStatus.SUCCESS
+
+
+def test_rich_markdown_streamer_block_rendering() -> None:
+    from rich.console import Console
+
+    from cli_agent.main import RichMarkdownStreamer
+
+    console = Console(record=True, width=80)
+    streamer = RichMarkdownStreamer(console=console, prompt_label="[agent]\n")
+
+    streamer.on_chunk("### Header 1\n\n")
+    streamer.on_chunk("This is **bold** text.\n\n")
+    streamer.on_chunk("- Item 1\n- Item 2\n\n")
+    streamer.on_chunk("```python\ndef foo():\n    return 42\n```\n\n")
+    streamer.on_tool_call("read_file", {"path": "src/app.py"})
+    streamer.on_chunk("Trailing conclusion")
+    full_text = streamer.finalize()
+
+    assert "Header 1" in full_text
+    assert "Trailing conclusion" in full_text
+    output = console.export_text()
+    assert "Header 1" in output
+    assert "Item 1" in output
+    assert "Calling Tool" in output
+
