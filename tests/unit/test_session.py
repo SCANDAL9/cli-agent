@@ -10,7 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent.main import main, print_help, run_oneshot, show_sessions
+from cli_agent.main import (
+    main,
+    print_help,
+    render_session_transcript,
+    run_oneshot,
+    show_sessions,
+)
 from cli_agent.session import (
     SessionRecord,
     SessionStore,
@@ -356,3 +362,37 @@ async def test_run_oneshot_with_resumed_session(tmp_path: Path) -> None:
     assert updated is not None
     assert updated.turn_count == 3
     assert updated.messages[-1]["role"] == "model"
+
+
+def test_render_session_transcript_replays_full_history() -> None:
+    from rich.console import Console
+
+    rec_console = Console(record=True, width=100)
+    messages = [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "[Image #1] Explica esta arquitectura"},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}},
+            ],
+        },
+        {
+            "role": "model",
+            "parts": [
+                {"text": "### Resumen\n\nFlujo: Cliente $\\rightarrow$ Servidor (`O(n^2)`)."},
+            ],
+        },
+        {
+            "role": "user",
+            "parts": [{"functionResponse": {"name": "read_file", "response": {"ok": True}}}],
+        },
+    ]
+
+    render_session_transcript(messages, console_obj=rec_console)
+    output = rec_console.export_text()
+    assert "Explica esta arquitectura" in output
+    assert "1 image(s) attached (image/png)" in output
+    assert "kanon ❯" in output
+    assert "Cliente → Servidor" in output
+    assert "read_file" not in output
+

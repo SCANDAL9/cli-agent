@@ -26,6 +26,7 @@ dev = [
 ]
 
 [project.scripts]
+kanon = "cli_agent:main"
 cli-agent = "cli_agent:main"
 
 [build-system]

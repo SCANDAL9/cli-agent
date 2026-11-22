@@ -54,6 +54,7 @@ from .doctor import run_diagnostics
 from .mcp import MCPRegistry, set_active_mcp_registry
 from .memory import MemoryStore, resolve_project_key
 from .models import ModelCatalogEntry, fetch_model_garden_catalog
+from .notifications import send_background_notification
 from .pr import CIWatcher, PRSynthesizer, detect_git_host_provider
 from .preflight import PreflightEngine, ProjectSelector, ServiceUsageManager
 from .search import get_hybrid_search_engine
@@ -64,6 +65,7 @@ from .team import MultiAgentTeam, set_active_team
 from .theme import (
     MatugenPalette,
     build_prompt_toolkit_style,
+    build_rich_theme,
     hex_to_ansi_fg,
     load_matugen_palette,
 )
@@ -73,7 +75,8 @@ from .vertex import VertexAgentClient
 from .voice import VoiceAgentEngine
 from .worktree import DiffViewer, WorktreeManager, WorktreeSession
 
-console = Console()
+matugen_palette: MatugenPalette = load_matugen_palette()
+console = Console(theme=build_rich_theme(matugen_palette))
 
 SLASH_COMMANDS = [
     "/auto",
@@ -171,7 +174,6 @@ command_completer: Completer = AgentInputCompleter(
     slash_completer=_slash_word_completer, path_completer=_path_completer
 )
 
-matugen_palette: MatugenPalette = load_matugen_palette()
 pt_style = build_prompt_toolkit_style(matugen_palette)
 
 
@@ -219,9 +221,12 @@ _IMAGE_TOKEN_RE = re.compile(r"\[Image #(\d+)\] ?")
 
 class AlternateScreenWorkspace:
     """
-    Isolates the interactive agent session inside the terminal's Alternate Screen Buffer
-    (DEC private mode 1049: \\x1b[?1049h on enter, \\x1b[r\\x1b[?1049l on exit).
-    Prevents scrolling back into prior shell commands and restores the original terminal cleanly.
+    Creates a clean, isolated session workspace in Kitty/ANSI terminals without disabling
+    native terminal scrollback:
+    - On enter: erases prior shell scrollback (`\\x1b[3J`), clears the viewport (`\\x1b[2J`),
+      and moves cursor home (`\\x1b[H`), so prior terminal commands cannot be scrolled back to,
+      while keeping full native mouse/keyboard scrollback for the entire kanon session.
+    - On exit: resets scroll margins (`\\x1b[r`) cleanly.
     """
 
     def __init__(self, stream: Any | None = None, enabled: bool | None = None) -> None:
@@ -234,16 +239,16 @@ class AlternateScreenWorkspace:
 
     def __enter__(self) -> "AlternateScreenWorkspace":
         if self._enabled and not self._active:
-            # Enter alternate screen buffer, clear it, and move cursor to home (1,1)
-            self._stream.write("\x1b[?1049h\x1b[2J\x1b[H")
+            # Erase prior scrollback (ED 3) + clear screen (ED 2) + home cursor
+            self._stream.write("\x1b[3J\x1b[2J\x1b[H")
             self._stream.flush()
             self._active = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._active:
-            # Reset scroll margins and leave alternate screen buffer cleanly
-            self._stream.write("\x1b[r\x1b[?1049l")
+            # Reset scroll margins cleanly
+            self._stream.write("\x1b[r")
             self._stream.flush()
             self._active = False
 
@@ -545,7 +550,7 @@ def print_banner(
     c_border = p.border if p.is_matugen else "dim cyan"
     theme_badge = f" [dim]•[/dim] [{c_secondary}]Matugen[/{c_secondary}]" if p.is_matugen else ""
     banner_text = (
-        f"[bold {c_primary}]cli-agent[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
+        f"[bold {c_primary}]kanon[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
         f"[{c_secondary}]SQLite Memory ({memory_count} memories)[/{c_secondary}] [dim]•[/dim] [{c_primary}]AST Code Graph[/{c_primary}]{theme_badge}\n"
         f"[dim]Workspace:[/dim] [bold white]~/{ws_name}[/bold white] [dim]•[/dim] [dim]{session_badge}[/dim]\n"
         f"[dim]Shortcuts:[/dim] [bold {c_primary}]![/bold {c_primary}] [dim]shell[/dim]   "
@@ -556,11 +561,87 @@ def print_banner(
     console.print(
         Panel(
             banner_text,
-            title=f"[bold {c_primary}]❖ AI Developer Assistant[/bold {c_primary}]",
+            title=f"[bold {c_primary}]❖ kanon — AI Developer Assistant[/bold {c_primary}]",
             border_style=c_border,
             box=box.ROUNDED,
         )
     )
+
+
+def render_session_transcript(
+    messages: list[dict[str, Any]],
+    console_obj: Console | None = None,
+) -> None:
+    """
+    Replays a resumed session's full conversation transcript (user prompts, image badges,
+    and assistant Markdown + LaTeX Unicode responses) so `kanon -c` / `/resume` restores
+    the exact visual view of the previous session.
+    """
+    if not messages:
+        return
+
+    out = console_obj or console
+    p = load_matugen_palette()
+    c_primary = p.primary if p.is_matugen else "cyan"
+    c_secondary = p.secondary if p.is_matugen else "magenta"
+    c_border = p.border if p.is_matugen else "dim"
+    term_w = max(20, shutil.get_terminal_size((80, 24)).columns)
+    sep = "─" * term_w
+
+    for msg in messages:
+        role = msg.get("role", "")
+        parts = msg.get("parts", [])
+        if not isinstance(parts, list):
+            continue
+
+        if role == "user":
+            text_chunks = [
+                str(part.get("text", "")).strip()
+                for part in parts
+                if isinstance(part, dict) and "text" in part and str(part.get("text", "")).strip()
+            ]
+            image_mimes = [
+                str(part["inlineData"].get("mimeType", "image"))
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("inlineData"), dict)
+            ]
+            if not text_chunks and not image_mimes:
+                continue
+
+            out.print(f"\n[{c_border}]{sep}[/{c_border}]")
+            if text_chunks:
+                out.print(f"[bold {c_primary}]❯[/bold {c_primary}] " + "\n".join(text_chunks))
+            if image_mimes:
+                mimes_str = ", ".join(image_mimes)
+                out.print(
+                    f"[dim]🖼 {len(image_mimes)} image(s) attached ({mimes_str})[/dim]"
+                )
+            out.print(f"[{c_border}]{sep}[/{c_border}]")
+
+        elif role == "model":
+            text_chunks = [
+                str(part.get("text", ""))
+                for part in parts
+                if isinstance(part, dict)
+                and "text" in part
+                and part.get("text")
+                and not part.get("thought")
+            ]
+            tool_names = [
+                str(part["functionCall"].get("name", "tool"))
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("functionCall"), dict)
+            ]
+            if not text_chunks and not tool_names:
+                continue
+
+            out.print(f"\n[bold {c_secondary}]kanon ❯[/bold {c_secondary}]")
+            if tool_names:
+                out.print(f"[dim]⚡ Tools: {', '.join(tool_names)}[/dim]")
+            combined = "".join(text_chunks).strip()
+            if combined:
+                out.print(Markdown(render_latex_unicode(combined)))
+                out.print()
 
 
 def show_sessions(session_store: SessionStore, project_key: str | None = None) -> None:
@@ -1012,6 +1093,15 @@ def make_security_policy(auto_approve: bool = False) -> SecurityPolicy:
                 box=box.ROUNDED,
             )
         )
+        arg_summary = ""
+        if args:
+            first_val = next(iter(args.values()), "")
+            arg_summary = f": {str(first_val)[:80]}"
+        send_background_notification(
+            title=f"kanon — Permiso requerido ({risk.value.upper()})",
+            body=f"{tool_name}{arg_summary}",
+            urgency="critical" if risk == RiskLevel.HIGH else "normal",
+        )
         try:
             choice = (
                 console.input("[bold white]Select an option [y/n/a] (default 'n'): [/bold white]")
@@ -1224,7 +1314,7 @@ class RichMarkdownStreamer:
     """
 
     def __init__(
-        self, console: Console, prompt_label: str = "\n[bold magenta]agent ❯[/bold magenta]\n"
+        self, console: Console, prompt_label: str = "\n[bold magenta]kanon ❯[/bold magenta]\n"
     ) -> None:
         self.console = console
         self.prompt_label = prompt_label
@@ -1458,6 +1548,8 @@ async def _run_interactive_session(
         session_id=active_session_id,
         turn_count=len(conversation_history),
     )
+    if conversation_history:
+        render_session_transcript(conversation_history, console_obj=console)
 
     DEFAULT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     pending_images: list[ImageAttachment] = []
@@ -1671,13 +1763,16 @@ async def _run_interactive_session(
                 conversation_history = [dict(m) for m in target.messages]
                 if not model_override:
                     client.switch_model(target.model_name)
+                if sys.stdout.isatty():
+                    sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+                    sys.stdout.flush()
                 console.print(
                     f"[bold green]✔ Switched to session [bold cyan]{target.id}[/bold cyan] "
                     f"({len(conversation_history)} turns, model: {target.model_name})[/bold green]\n"
                     f"[dim]Title: {target.title} | Updated: {target.updated_at}[/dim]"
                 )
-                if target.preview:
-                    console.print(f"[dim]Context snippet: {target.preview}[/dim]")
+                if conversation_history:
+                    render_session_transcript(conversation_history, console_obj=console)
             else:
                 target_label = arg if arg else "latest"
                 console.print(f"[bold red]Session '{target_label}' not found.[/bold red]")
@@ -2379,6 +2474,15 @@ async def _run_interactive_session(
                 model_name=client.model_name,
                 project_key=project_key,
             )
+            first_line = next(
+                (ln.strip() for ln in full_response.splitlines() if ln.strip()),
+                "Respuesta lista.",
+            )
+            send_background_notification(
+                title="kanon — Tarea completada",
+                body=first_line,
+                urgency="normal",
+            )
         else:
             # Remove unanswered user turn and notify the user instead of failing silently
             if conversation_history and conversation_history[-1].get("role") == "user":
@@ -2392,9 +2496,9 @@ async def _run_interactive_session(
 def print_help() -> None:
     console.print(
         Panel.fit(
-            "[bold cyan]cli-agent[/bold cyan] - Autonomous AI Developer Assistant\n\n"
+            "[bold cyan]kanon[/bold cyan] - Autonomous AI Developer Assistant\n\n"
             "[bold]Usage:[/bold]\n"
-            "  cli-agent [options] [prompt]\n\n"
+            "  kanon [options] [prompt]\n\n"
             "[bold]Session Options:[/bold]\n"
             "  [bold cyan]-c, --continue[/bold cyan]              Resume the most recent session in this workspace\n"
             "  [bold cyan]--resume [SESSION_ID][/bold cyan]       Resume a specific session (or latest if omitted)\n"
@@ -2409,7 +2513,7 @@ def print_help() -> None:
             "  [bold cyan]-h, --help[/bold cyan]                  Show this help overview and exit\n\n"
             "[bold]REPL Slash Commands:[/bold]\n"
             "  /sessions, /resume [id], /session, /memories, /model, /pr, /doctor, /exit",
-            title="[bold magenta]cli-agent CLI Help[/bold magenta]",
+            title="[bold magenta]kanon CLI Help[/bold magenta]",
             border_style="cyan",
             box=box.ROUNDED,
         )
