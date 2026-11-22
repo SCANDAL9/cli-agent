@@ -568,6 +568,82 @@ def print_banner(
     )
 
 
+def render_session_transcript(
+    messages: list[dict[str, Any]],
+    console_obj: Console | None = None,
+) -> None:
+    """
+    Replays a resumed session's full conversation transcript (user prompts, image badges,
+    and assistant Markdown + LaTeX Unicode responses) so `kanon -c` / `/resume` restores
+    the exact visual view of the previous session.
+    """
+    if not messages:
+        return
+
+    out = console_obj or console
+    p = load_matugen_palette()
+    c_primary = p.primary if p.is_matugen else "cyan"
+    c_secondary = p.secondary if p.is_matugen else "magenta"
+    c_border = p.border if p.is_matugen else "dim"
+    term_w = max(20, shutil.get_terminal_size((80, 24)).columns)
+    sep = "─" * term_w
+
+    for msg in messages:
+        role = msg.get("role", "")
+        parts = msg.get("parts", [])
+        if not isinstance(parts, list):
+            continue
+
+        if role == "user":
+            text_chunks = [
+                str(part.get("text", "")).strip()
+                for part in parts
+                if isinstance(part, dict) and "text" in part and str(part.get("text", "")).strip()
+            ]
+            image_mimes = [
+                str(part["inlineData"].get("mimeType", "image"))
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("inlineData"), dict)
+            ]
+            if not text_chunks and not image_mimes:
+                continue
+
+            out.print(f"\n[{c_border}]{sep}[/{c_border}]")
+            if text_chunks:
+                out.print(f"[bold {c_primary}]❯[/bold {c_primary}] " + "\n".join(text_chunks))
+            if image_mimes:
+                mimes_str = ", ".join(image_mimes)
+                out.print(
+                    f"[dim]🖼 {len(image_mimes)} image(s) attached ({mimes_str})[/dim]"
+                )
+            out.print(f"[{c_border}]{sep}[/{c_border}]")
+
+        elif role == "model":
+            text_chunks = [
+                str(part.get("text", ""))
+                for part in parts
+                if isinstance(part, dict)
+                and "text" in part
+                and part.get("text")
+                and not part.get("thought")
+            ]
+            tool_names = [
+                str(part["functionCall"].get("name", "tool"))
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("functionCall"), dict)
+            ]
+            if not text_chunks and not tool_names:
+                continue
+
+            out.print(f"\n[bold {c_secondary}]kanon ❯[/bold {c_secondary}]")
+            if tool_names:
+                out.print(f"[dim]⚡ Tools: {', '.join(tool_names)}[/dim]")
+            combined = "".join(text_chunks).strip()
+            if combined:
+                out.print(Markdown(render_latex_unicode(combined)))
+                out.print()
+
+
 def show_sessions(session_store: SessionStore, project_key: str | None = None) -> None:
     sessions = session_store.list_sessions(project_key=project_key, limit=20)
     if not sessions:
@@ -1472,6 +1548,8 @@ async def _run_interactive_session(
         session_id=active_session_id,
         turn_count=len(conversation_history),
     )
+    if conversation_history:
+        render_session_transcript(conversation_history, console_obj=console)
 
     DEFAULT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     pending_images: list[ImageAttachment] = []
@@ -1685,13 +1763,16 @@ async def _run_interactive_session(
                 conversation_history = [dict(m) for m in target.messages]
                 if not model_override:
                     client.switch_model(target.model_name)
+                if sys.stdout.isatty():
+                    sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+                    sys.stdout.flush()
                 console.print(
                     f"[bold green]✔ Switched to session [bold cyan]{target.id}[/bold cyan] "
                     f"({len(conversation_history)} turns, model: {target.model_name})[/bold green]\n"
                     f"[dim]Title: {target.title} | Updated: {target.updated_at}[/dim]"
                 )
-                if target.preview:
-                    console.print(f"[dim]Context snippet: {target.preview}[/dim]")
+                if conversation_history:
+                    render_session_transcript(conversation_history, console_obj=console)
             else:
                 target_label = arg if arg else "latest"
                 console.print(f"[bold red]Session '{target_label}' not found.[/bold red]")
