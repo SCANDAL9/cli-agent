@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from prompt_toolkit.styles import Style
+from rich.theme import Theme as RichTheme
 
 DEFAULT_MATUGEN_PATHS: tuple[Path, ...] = (
     Path("/tmp/kitty-matugen-colors.conf"),
@@ -140,5 +141,44 @@ def build_prompt_toolkit_style(palette: MatugenPalette | None = None) -> Style:
             "completion-menu.meta.completion.current": "reverse",
             "scrollbar.background": "dim",
             "scrollbar.button": "ansicyan",
+        }
+    )
+
+
+def build_rich_theme(palette: MatugenPalette | None = None) -> RichTheme:
+    """
+    Builds a soft, low-glare Rich Theme harmonized with Matugen.
+    Replaces Rich's harsh default `markdown.code` (`bold cyan on black`, which turns
+    bright gray-green under Matugen palettes where color0 is muted/light) with a subtle pill.
+    """
+    p = palette or load_matugen_palette()
+    if p.is_matugen:
+        return RichTheme(
+            {
+                "markdown.code": f"{p.primary} on {p.surface}",
+                "markdown.code_block": f"{p.foreground} on {p.surface}",
+                "markdown.h1": f"bold {p.primary}",
+                "markdown.h2": f"bold {p.primary}",
+                "markdown.h3": f"bold {p.secondary}",
+                "markdown.h4": f"bold {p.secondary}",
+                "markdown.item.bullet": p.secondary,
+                "markdown.item.number": p.secondary,
+                "markdown.link": f"underline {p.secondary}",
+                "markdown.link_url": p.muted,
+                "markdown.hr": p.border,
+                "markdown.block_quote": f"italic {p.muted}",
+                "markdown.strong": f"bold {p.foreground}",
+            }
+        )
+    return RichTheme(
+        {
+            "markdown.code": "cyan",
+            "markdown.h1": "bold cyan",
+            "markdown.h2": "bold cyan",
+            "markdown.h3": "bold",
+            "markdown.item.bullet": "cyan",
+            "markdown.item.number": "cyan",
+            "markdown.hr": "dim",
+            "markdown.block_quote": "dim italic",
         }
     )
