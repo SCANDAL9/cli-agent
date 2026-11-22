@@ -19,6 +19,7 @@ from .circuit_breaker import (
     QuotaCircuitBreaker,
 )
 from .code_graph import CodeGraphStore
+from .config import normalize_effort
 from .memory import MemoryStore, resolve_project_key
 from .models import detect_publisher
 from .security import SecurityPolicy
@@ -52,10 +53,12 @@ class VertexAgentClient:
         fallback_router: FallbackRouter | None = None,
         circuit_breaker: QuotaCircuitBreaker | None = None,
         timeout: float | httpx.Timeout | None = None,
+        effort: str = "medium",
     ):
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
+        self.effort = normalize_effort(effort)
         self.timeout = (
             timeout
             if isinstance(timeout, httpx.Timeout)
@@ -101,6 +104,18 @@ class VertexAgentClient:
         self.model_name = model_name
         self.publisher = detect_publisher(model_name)
         self._configure_endpoints()
+
+    def set_effort(self, effort: str) -> str:
+        """Updates the active reasoning effort level ('low', 'medium', 'high')."""
+        self.effort = normalize_effort(effort)
+        return self.effort
+
+    def _build_generation_config(self) -> dict[str, Any]:
+        """Builds Vertex AI generationConfig including real thinkingConfig for Gemini models."""
+        gen_cfg: dict[str, Any] = {"temperature": 0.2}
+        if self.publisher == "google":
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": self.effort.upper()}
+        return gen_cfg
 
     def _build_system_instruction(self) -> str:
         project_key = resolve_project_key()
@@ -170,7 +185,7 @@ Guidelines:
         client_owner = False
         client = self._http_client
         if client is None:
-            client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+            client = httpx.AsyncClient(timeout=self.timeout)
             client_owner = True
 
         try:
@@ -178,7 +193,7 @@ Guidelines:
                 payload: dict[str, Any] = {
                     "contents": working_contents,
                     "system_instruction": {"parts": [{"text": active_instruction}]},
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": self._build_generation_config(),
                 }
                 if active_tools:
                     payload["tools"] = [{"function_declarations": active_tools}]
@@ -284,7 +299,7 @@ Guidelines:
         client_owner = False
         client = self._http_client
         if client is None:
-            client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+            client = httpx.AsyncClient(timeout=self.timeout)
             client_owner = True
 
         try:
@@ -295,7 +310,7 @@ Guidelines:
                 payload: dict[str, Any] = {
                     "contents": pruned_contents,
                     "system_instruction": {"parts": [{"text": active_instruction}]},
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": self._build_generation_config(),
                 }
                 if active_tools:
                     payload["tools"] = [{"function_declarations": active_tools}]
@@ -309,7 +324,7 @@ Guidelines:
                         f"{self.stream_endpoint}?alt=sse",
                         headers=headers,
                         json=payload,
-                        timeout=DEFAULT_TIMEOUT,
+                        timeout=self.timeout,
                     ) as response:
                         if response.status_code in (404, 429, 503):
                             err_body = await response.aread()
@@ -350,10 +365,10 @@ Guidelines:
                                     else ""
                                 )
                                 raise RuntimeError(
-                                    f"Vertex AI rate limit exceeded (HTTP 429).{remediation}{tip}"
+                                    f"Vertex AI rate limit exceeded (HTTP 429) for model '{self.model_name}'.{remediation}{tip}"
                                 )
                             raise RuntimeError(
-                                f"Vertex AI API error ({response.status_code}): {err_text}"
+                                f"Vertex AI API error ({response.status_code}) for model '{self.model_name}': {err_text}"
                             )
                         if response.status_code != 200:
                             err_body = await response.aread()
@@ -381,7 +396,7 @@ Guidelines:
                             parts = candidates[0].get("content", {}).get("parts", [])
                             for p in parts:
                                 full_content_parts.append(p)
-                                if "text" in p:
+                                if "text" in p and p["text"] and not p.get("thought"):
                                     yield p["text"]
                                 elif "functionCall" in p:
                                     function_calls.append(p["functionCall"])
@@ -436,6 +451,8 @@ Guidelines:
                     )
 
                 working_contents.append({"role": "user", "parts": tool_response_parts})
+
+            yield "\n\n*(Reached maximum tool iterations limit without a final response.)*"
 
         finally:
             if client_owner:

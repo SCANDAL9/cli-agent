@@ -4,6 +4,12 @@ from .circuit_breaker import (
     ModelEndpoint,
     QuotaCircuitBreaker,
 )
+from .clipboard import (
+    ImageAttachment,
+    load_image_from_path,
+    read_clipboard_image,
+    read_clipboard_text,
+)
 from .context import (
     compact_history,
     estimate_context_tokens,
@@ -82,6 +88,7 @@ __all__ = [
     "GeminiLiveSession",
     "GitHubProvider",
     "GitLabProvider",
+    "ImageAttachment",
     "LayoutMode",
     "LogSource",
     "MemoryStore",
@@ -117,8 +124,11 @@ __all__ = [
     "generate_session_id",
     "get_event_bus",
     "get_global_event_bus",
+    "load_image_from_path",
     "main",
     "prune_tool_responses",
+    "read_clipboard_image",
+    "read_clipboard_text",
     "resolve_project_key",
     "set_event_bus",
     "set_global_event_bus",

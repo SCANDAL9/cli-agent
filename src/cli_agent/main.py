@@ -5,16 +5,22 @@ prompt_toolkit history/autocompletion, and real-time SSE streaming.
 """
 
 import asyncio
+import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import AnyFormattedText, FormattedText
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console
@@ -24,9 +30,25 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from .circuit_breaker import FallbackRouter, ModelEndpoint, QuotaCircuitBreaker
+from .circuit_breaker import QuotaCircuitBreaker
+from .clipboard import (
+    ImageAttachment,
+    delete_kitty_image_sequence,
+    is_kitty_terminal,
+    load_image_from_path,
+    read_clipboard_image,
+    read_clipboard_text,
+    render_kitty_image_preview,
+)
 from .code_graph import CodeGraphIndexer
-from .config import DEFAULT_HISTORY_FILE, load_config, save_model_to_config
+from .config import (
+    DEFAULT_HISTORY_FILE,
+    VALID_EFFORT_LEVELS,
+    load_config,
+    normalize_effort,
+    save_effort_to_config,
+    save_model_to_config,
+)
 from .context import compact_history, extract_session_learnings
 from .doctor import run_diagnostics
 from .mcp import MCPRegistry, set_active_mcp_registry
@@ -39,6 +61,12 @@ from .security import RiskLevel, SecurityPolicy
 from .session import SessionStore, generate_session_id
 from .tdd import AutonomousTDDEngine
 from .team import MultiAgentTeam, set_active_team
+from .theme import (
+    MatugenPalette,
+    build_prompt_toolkit_style,
+    hex_to_ansi_fg,
+    load_matugen_palette,
+)
 from .tools import set_active_sandbox
 from .tui import TUIApp, TUILayoutManager
 from .vertex import VertexAgentClient
@@ -58,6 +86,7 @@ SLASH_COMMANDS = [
     "/setup",
     "/model",
     "/models",
+    "/effort",
     "/index",
     "/search",
     "/sandbox",
@@ -85,6 +114,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/setup": "Launch GCP project onboarding wizard",
     "/model": "Switch or inspect active Vertex AI model",
     "/models": "Explore Vertex AI Model Garden catalog",
+    "/effort": "Adjust AI thinking effort (low / medium / high)",
     "/index": "Re-index workspace code AST symbols",
     "/search": "Hybrid BM25 + dense vector code search",
     "/sandbox": "Manage isolated Git worktree sandbox",
@@ -141,33 +171,19 @@ command_completer: Completer = AgentInputCompleter(
     slash_completer=_slash_word_completer, path_completer=_path_completer
 )
 
-pt_style = Style.from_dict(
-    {
-        "prompt": "ansicyan bold",
-        "prompt.box": "dim",
-        "placeholder": "dim italic",
-        "bottom-toolbar": "noreverse",
-        "bottom-toolbar.text": "dim",
-        "bottom-toolbar.model": "ansicyan",
-        "bottom-toolbar.badge": "ansigreen",
-        "bottom-toolbar.badge.default": "dim",
-        "completion-menu": "reverse",
-        "completion-menu.completion": "",
-        "completion-menu.completion.current": "ansicyan bold reverse",
-        "completion-menu.meta": "dim italic",
-        "scrollbar.background": "dim",
-        "scrollbar.button": "ansicyan",
-    }
-)
+matugen_palette: MatugenPalette = load_matugen_palette()
+pt_style = build_prompt_toolkit_style(matugen_palette)
 
 
 def format_bottom_toolbar(
     terminal_width: int,
     auto_approve: bool,
     model_name: str,
+    image_count: int = 0,
+    effort: str | None = None,
 ) -> FormattedText:
     """Formats the REPL bottom toolbar with terminal-adaptive styling (no inverse contrast)."""
-    term_w = max(40, min(terminal_width, 100))
+    term_w = max(20, terminal_width)
     bot_border = f"{'─' * term_w}\n"
     mode_str = "auto" if auto_approve else "default"
     mode_class = (
@@ -176,13 +192,18 @@ def format_bottom_toolbar(
         else "class:bottom-toolbar.badge.default"
     )
     model_disp = _format_model_badge(model_name)
-    effort_disp = _get_model_effort(model_name)
-    status_text = f"{mode_str} • {model_disp} • {effort_disp}"
+    effort_disp = normalize_effort(effort) if effort else _get_model_effort(model_name)
+    img_prefix = f"🖼 {image_count} img • " if image_count > 0 else ""
+    status_text = f"{img_prefix}{mode_str} • {model_disp} • {effort_disp}"
     pad = " " * max(0, term_w - len(status_text) - 1)
-    return FormattedText(
+    tokens: list[tuple[str, str]] = [
+        ("class:prompt.box", bot_border),
+        ("class:bottom-toolbar.text", pad),
+    ]
+    if img_prefix:
+        tokens.append(("class:bottom-toolbar.model", img_prefix))
+    tokens.extend(
         [
-            ("class:prompt.box", bot_border),
-            ("class:bottom-toolbar.text", pad),
             (mode_class, mode_str),
             ("class:bottom-toolbar.text", " • "),
             ("class:bottom-toolbar.model", model_disp),
@@ -190,6 +211,288 @@ def format_bottom_toolbar(
             ("class:bottom-toolbar.text", effort_disp),
         ]
     )
+    return FormattedText(tokens)
+
+
+_IMAGE_TOKEN_RE = re.compile(r"\[Image #(\d+)\] ?")
+
+
+class AlternateScreenWorkspace:
+    """
+    Isolates the interactive agent session inside the terminal's Alternate Screen Buffer
+    (DEC private mode 1049: \\x1b[?1049h on enter, \\x1b[r\\x1b[?1049l on exit).
+    Prevents scrolling back into prior shell commands and restores the original terminal cleanly.
+    """
+
+    def __init__(self, stream: Any | None = None, enabled: bool | None = None) -> None:
+        self._stream = stream or sys.stdout
+        if enabled is not None:
+            self._enabled = enabled
+        else:
+            self._enabled = bool(getattr(self._stream, "isatty", lambda: False)())
+        self._active = False
+
+    def __enter__(self) -> "AlternateScreenWorkspace":
+        if self._enabled and not self._active:
+            # Enter alternate screen buffer, clear it, and move cursor to home (1,1)
+            self._stream.write("\x1b[?1049h\x1b[2J\x1b[H")
+            self._stream.flush()
+            self._active = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._active:
+            # Reset scroll margins and leave alternate screen buffer cleanly
+            self._stream.write("\x1b[r\x1b[?1049l")
+            self._stream.flush()
+            self._active = False
+
+
+class PinnedFooterManager:
+    """
+    Keeps the bottom 2 rows (horizontal separator + status/model bar) permanently pinned
+    at the bottom of Kitty/ANSI terminals using DECSTBM scroll regions while the agent
+    streams responses or executes tools. Always resets scroll margins cleanly on unpin().
+    """
+
+    def __init__(self, stream: Any | None = None, enabled: bool | None = None) -> None:
+        self._stream = stream or sys.stdout
+        if enabled is not None:
+            self._enabled = enabled
+        else:
+            self._enabled = bool(getattr(self._stream, "isatty", lambda: False)())
+        self._pinned = False
+        self._rows = 24
+        self._cols = 80
+
+    def _refresh_size(self) -> tuple[int, int]:
+        size = shutil.get_terminal_size((80, 24))
+        self._cols = max(20, size.columns)
+        self._rows = max(6, size.lines)
+        return self._cols, self._rows
+
+    def _paint_footer(
+        self,
+        activity: str,
+        auto_approve: bool,
+        model_name: str,
+        image_count: int = 0,
+        effort: str | None = None,
+    ) -> None:
+        cols, rows = self._cols, self._rows
+        border = "─" * cols
+        mode_str = "auto" if auto_approve else "default"
+        model_disp = _format_model_badge(model_name)
+        effort_disp = normalize_effort(effort) if effort else _get_model_effort(model_name)
+        img_prefix = f"🖼 {image_count} img • " if image_count > 0 else ""
+        right_text = f"{img_prefix}{mode_str} • {model_disp} • {effort_disp}"
+        left_text = activity.strip()
+        max_left = max(0, cols - len(right_text) - 3)
+        if len(left_text) > max_left:
+            left_text = left_text[: max(0, max_left - 1)] + "…" if max_left > 1 else ""
+        pad = " " * max(1, cols - len(left_text) - len(right_text) - 1)
+
+        p = load_matugen_palette()
+        if p.is_matugen:
+            c_border = hex_to_ansi_fg(p.border)
+            c_act = hex_to_ansi_fg(p.primary)
+            c_muted = hex_to_ansi_fg(p.muted)
+            c_mode = hex_to_ansi_fg(p.accent) if auto_approve else c_muted
+            c_model = f"\x1b[1m{hex_to_ansi_fg(p.primary)}"
+        else:
+            c_border = "\x1b[2m"
+            c_act = "\x1b[36m"
+            c_muted = "\x1b[2m"
+            c_mode = "\x1b[32m" if auto_approve else "\x1b[2m"
+            c_model = "\x1b[1m"
+
+        footer_line = (
+            f"{c_act}{left_text}\x1b[0m"
+            f"{pad}"
+            f"{c_muted}{img_prefix}\x1b[0m"
+            f"{c_mode}{mode_str}\x1b[0m"
+            f"{c_muted} • \x1b[0m"
+            f"{c_model}{model_disp}\x1b[0m"
+            f"{c_muted} • {effort_disp}\x1b[0m"
+        )
+
+        # Save cursor, draw border on row (rows-1) and status on row (rows), restore cursor
+        self._stream.write(
+            f"\x1b7"
+            f"\x1b[{rows - 1};1H\x1b[2K{c_border}{border}\x1b[0m"
+            f"\x1b[{rows};1H\x1b[2K{footer_line}"
+            f"\x1b8"
+        )
+        self._stream.flush()
+
+    def pin(
+        self,
+        activity: str,
+        auto_approve: bool,
+        model_name: str,
+        image_count: int = 0,
+        effort: str | None = None,
+    ) -> None:
+        """Locks bottom 2 rows with DECSTBM scroll region and paints the pinned footer."""
+        if not self._enabled:
+            return
+        _, rows = self._refresh_size()
+        scroll_bottom = max(2, rows - 2)
+        # Set top..scroll_bottom scroll region; keep cursor inside scroll region
+        self._stream.write(f"\x1b7\x1b[1;{scroll_bottom}r\x1b8")
+        self._pinned = True
+        self._paint_footer(
+            activity=activity,
+            auto_approve=auto_approve,
+            model_name=model_name,
+            image_count=image_count,
+            effort=effort,
+        )
+
+    def update(
+        self,
+        activity: str,
+        auto_approve: bool,
+        model_name: str,
+        image_count: int = 0,
+        effort: str | None = None,
+    ) -> None:
+        """Updates the pinned footer text without moving the main scroll cursor."""
+        if not self._enabled or not self._pinned:
+            return
+        self._refresh_size()
+        self._paint_footer(
+            activity=activity,
+            auto_approve=auto_approve,
+            model_name=model_name,
+            image_count=image_count,
+            effort=effort,
+        )
+
+    def unpin(self) -> None:
+        """Restores full-terminal scroll margins cleanly."""
+        if not self._enabled or not self._pinned:
+            return
+        rows = self._rows
+        # Reset DECSTBM to full screen and clear pinned footer rows before prompt_toolkit takes over
+        self._stream.write(
+            f"\x1b7"
+            f"\x1b[{rows - 1};1H\x1b[2K"
+            f"\x1b[{rows};1H\x1b[2K"
+            f"\x1b[r"
+            f"\x1b8"
+        )
+        self._stream.flush()
+        self._pinned = False
+
+
+def build_input_key_bindings(
+    pending_images: list[ImageAttachment],
+    enable_kitty_preview: bool = True,
+) -> KeyBindings:
+    """
+    Builds prompt_toolkit key bindings supporting:
+    - Ctrl+V: clipboard image paste (with native Kitty Graphics preview) and text fallback
+    - Backspace / Delete: atomic deletion of [Image #N] tokens and their pending attachments
+    """
+    kb = KeyBindings()
+
+    def _trigger_preview(attachment: ImageAttachment) -> None:
+        if not enable_kitty_preview or not is_kitty_terminal():
+            return
+        try:
+            run_in_terminal(lambda: render_kitty_image_preview(attachment))
+        except Exception:
+            pass
+
+    def _trigger_delete_preview(attachment: ImageAttachment) -> None:
+        if not enable_kitty_preview or not is_kitty_terminal():
+            return
+        seq = delete_kitty_image_sequence(9000 + attachment.index)
+        if seq:
+            try:
+                sys.stdout.write(seq)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def _remove_attachment_by_index(img_index: int) -> ImageAttachment | None:
+        for i, att in enumerate(pending_images):
+            if att.index == img_index:
+                return pending_images.pop(i)
+        return None
+
+    @kb.add("c-v")
+    def _handle_ctrl_v(event: Any) -> None:
+        """Ctrl+V pastes images only; plain text paste remains native Linux Ctrl+Shift+V."""
+        img_result = read_clipboard_image()
+        if img_result is not None:
+            mime_type, raw_bytes = img_result
+            next_idx = max((img.index for img in pending_images), default=0) + 1
+            attachment = ImageAttachment(
+                index=next_idx,
+                mime_type=mime_type,
+                data=raw_bytes,
+                source="clipboard",
+            )
+            pending_images.append(attachment)
+            event.current_buffer.insert_text(f"{attachment.token} ")
+            _trigger_preview(attachment)
+            return
+
+        # Also support pasting an image file path copied from a file manager,
+        # but ignore plain text so Ctrl+Shift+V handles text paste natively.
+        clip_text = read_clipboard_text()
+        if clip_text:
+            path_img = load_image_from_path(clip_text)
+            if path_img is not None:
+                mime_type, raw_bytes = path_img
+                next_idx = max((img.index for img in pending_images), default=0) + 1
+                attachment = ImageAttachment(
+                    index=next_idx,
+                    mime_type=mime_type,
+                    data=raw_bytes,
+                    source=clip_text.strip(),
+                )
+                pending_images.append(attachment)
+                event.current_buffer.insert_text(f"{attachment.token} ")
+                _trigger_preview(attachment)
+
+    @kb.add("backspace")
+    def _handle_backspace(event: Any) -> None:
+        buf = event.current_buffer
+        text = buf.text
+        pos = buf.cursor_position
+        if pos > 0:
+            for m in _IMAGE_TOKEN_RE.finditer(text):
+                if m.start() < pos <= m.end():
+                    img_idx = int(m.group(1))
+                    buf.text = text[: m.start()] + text[m.end() :]
+                    buf.cursor_position = m.start()
+                    removed = _remove_attachment_by_index(img_idx)
+                    if removed is not None:
+                        _trigger_delete_preview(removed)
+                    return
+        buf.delete_before_cursor(count=1)
+
+    @kb.add("delete")
+    def _handle_delete(event: Any) -> None:
+        buf = event.current_buffer
+        text = buf.text
+        pos = buf.cursor_position
+        if pos < len(text):
+            for m in _IMAGE_TOKEN_RE.finditer(text):
+                if m.start() <= pos < m.end():
+                    img_idx = int(m.group(1))
+                    buf.text = text[: m.start()] + text[m.end() :]
+                    buf.cursor_position = m.start()
+                    removed = _remove_attachment_by_index(img_idx)
+                    if removed is not None:
+                        _trigger_delete_preview(removed)
+                    return
+        buf.delete(count=1)
+
+    return kb
 
 
 def _format_model_badge(name: str) -> str:
@@ -235,19 +538,26 @@ def print_banner(
         if session_id
         else "[dim]Fresh Session[/dim]"
     )
+    p = load_matugen_palette()
+    c_primary = p.primary if p.is_matugen else "cyan"
+    c_accent = p.accent if p.is_matugen else "green"
+    c_secondary = p.secondary if p.is_matugen else "magenta"
+    c_border = p.border if p.is_matugen else "dim cyan"
+    theme_badge = f" [dim]•[/dim] [{c_secondary}]Matugen[/{c_secondary}]" if p.is_matugen else ""
     banner_text = (
-        f"[bold cyan]cli-agent[/bold cyan] [dim]•[/dim] [bold green]{model_name}[/bold green] [dim]•[/dim] "
-        f"[yellow]SQLite Memory ({memory_count} memories)[/yellow] [dim]•[/dim] [magenta]AST Code Graph[/magenta]\n"
+        f"[bold {c_primary}]cli-agent[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
+        f"[{c_secondary}]SQLite Memory ({memory_count} memories)[/{c_secondary}] [dim]•[/dim] [{c_primary}]AST Code Graph[/{c_primary}]{theme_badge}\n"
         f"[dim]Workspace:[/dim] [bold white]~/{ws_name}[/bold white] [dim]•[/dim] [dim]{session_badge}[/dim]\n"
-        f"[dim]Shortcuts:[/dim] [bold cyan]![/bold cyan] [dim]shell[/dim]   "
-        f"[bold cyan]/[/bold cyan] [dim]commands[/dim]   "
-        f"[bold cyan]@[/bold cyan] [dim]files[/dim]   [dim]• type [bold]/help[/bold] for full reference[/dim]"
+        f"[dim]Shortcuts:[/dim] [bold {c_primary}]![/bold {c_primary}] [dim]shell[/dim]   "
+        f"[bold {c_primary}]/[/bold {c_primary}] [dim]commands[/dim]   "
+        f"[bold {c_primary}]@[/bold {c_primary}] [dim]files[/dim]   "
+        f"[bold {c_primary}]Ctrl+V[/bold {c_primary}] [dim]paste image[/dim]   [dim]• type [bold]/help[/bold] for full reference[/dim]"
     )
     console.print(
         Panel(
             banner_text,
-            title="[bold #38bdf8]❖ AI Developer Assistant[/bold #38bdf8]",
-            border_style="dim cyan",
+            title=f"[bold {c_primary}]❖ AI Developer Assistant[/bold {c_primary}]",
+            border_style=c_border,
             box=box.ROUNDED,
         )
     )
@@ -405,13 +715,166 @@ async def show_models(
     return display_catalog
 
 
+def _build_model_picker_app(
+    gemini_models: list[ModelCatalogEntry],
+    descriptions: dict[str, str],
+    active_model: str,
+    active_effort: str = "medium",
+    palette: MatugenPalette | None = None,
+) -> tuple[Application[tuple[str, str] | None], dict[str, int]]:
+    """
+    Builds an interactive prompt_toolkit Application allowing:
+    - ↑/↓ (or k/j): navigate models
+    - ←/→ (or h/l): slide real thinking effort (low / medium / high) directly under the hovered model
+    - 1-9: quick-select model with current effort
+    - Enter: confirm selected model + effort
+    - Esc / q / Ctrl+C: cancel
+    """
+    p = palette or load_matugen_palette()
+    initial_idx = 0
+    for idx, m in enumerate(gemini_models):
+        if m.short_name == active_model or m.model_id == active_model:
+            initial_idx = idx
+            break
+
+    norm_eff = normalize_effort(active_effort)
+    initial_eff_idx = VALID_EFFORT_LEVELS.index(norm_eff)
+    state: dict[str, int] = {"selected": initial_idx, "effort_idx": initial_eff_idx}
+
+    def _render_effort_slider(eff_idx: int) -> list[tuple[str, str]]:
+        """Renders an interactive horizontal slider bar for low / medium / high effort."""
+        parts: list[tuple[str, str]] = [("class:picker.effort_label", "       Effort  ◀ ")]
+        for i, level in enumerate(VALID_EFFORT_LEVELS):
+            if i > 0:
+                parts.append(("class:picker.border", "───"))
+            if i == eff_idx:
+                parts.append(("class:picker.effort_active", f"[● {level}]"))
+            else:
+                parts.append(("class:picker.desc", f"○ {level}"))
+        parts.append(("class:picker.effort_label", " ▶  (←/→)\n"))
+        return parts
+
+    def _render_menu() -> FormattedText:
+        sel = state["selected"]
+        eff_idx = state["effort_idx"]
+        term_w = max(50, shutil.get_terminal_size((80, 24)).columns)
+        sep = "─" * min(term_w - 4, 72)
+        fragments: list[tuple[str, str]] = [
+            ("class:picker.title", "  ❖ Switch Model & Thinking Effort\n"),
+            ("class:picker.border", f"  {sep}\n"),
+        ]
+        for idx, m in enumerate(gemini_models):
+            is_sel = idx == sel
+            is_curr = m.short_name == active_model or m.model_id == active_model
+            pointer = " ❯ " if is_sel else "   "
+            curr_tag = "  ✔ active" if is_curr else ""
+            row_style = "class:picker.selected" if is_sel else "class:picker.item"
+            num_style = "class:picker.selected" if is_sel else "class:picker.num"
+            desc = descriptions.get(m.short_name, "Google Vertex AI foundation model")
+
+            fragments.append((row_style, f"{pointer}"))
+            fragments.append((num_style, f"[{idx + 1}] "))
+            fragments.append((row_style, f"{m.short_name}"))
+            if curr_tag:
+                fragments.append(("class:picker.active", curr_tag))
+            fragments.append(("", "\n"))
+            fragments.append(("class:picker.desc", f"       {desc}\n"))
+            if is_sel:
+                fragments.extend(_render_effort_slider(eff_idx))
+
+        fragments.append(("class:picker.border", f"  {sep}\n"))
+        fragments.append(
+            (
+                "class:picker.hint",
+                f"  ↑/↓ model  •  ←/→ effort  •  1-{len(gemini_models)} quick pick  •  Enter confirm  •  Esc cancel\n",
+            )
+        )
+        return FormattedText(fragments)
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _move_up(event: Any) -> None:
+        state["selected"] = (state["selected"] - 1) % len(gemini_models)
+
+    @kb.add("down")
+    @kb.add("j")
+    def _move_down(event: Any) -> None:
+        state["selected"] = (state["selected"] + 1) % len(gemini_models)
+
+    @kb.add("left")
+    @kb.add("h")
+    def _effort_left(event: Any) -> None:
+        state["effort_idx"] = max(0, state["effort_idx"] - 1)
+
+    @kb.add("right")
+    @kb.add("l")
+    def _effort_right(event: Any) -> None:
+        state["effort_idx"] = min(len(VALID_EFFORT_LEVELS) - 1, state["effort_idx"] + 1)
+
+    @kb.add("enter")
+    def _confirm(event: Any) -> None:
+        chosen_model = gemini_models[state["selected"]].short_name
+        chosen_effort = VALID_EFFORT_LEVELS[state["effort_idx"]]
+        event.app.exit(result=(chosen_model, chosen_effort))
+
+    @kb.add("escape")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    for num_idx in range(1, min(len(gemini_models), 9) + 1):
+        def _make_num_handler(target_i: int) -> Any:
+            def _pick_num(event: Any) -> None:
+                state["selected"] = target_i
+                chosen_effort = VALID_EFFORT_LEVELS[state["effort_idx"]]
+                event.app.exit(result=(gemini_models[target_i].short_name, chosen_effort))
+
+            return _pick_num
+
+        kb.add(str(num_idx))(_make_num_handler(num_idx - 1))
+
+    picker_style = Style.from_dict(
+        {
+            "picker.title": f"{p.primary} bold" if p.is_matugen else "ansicyan bold",
+            "picker.border": p.border if p.is_matugen else "dim",
+            "picker.selected": (
+                f"bg:{p.selection_bg} {p.selection_fg} bold"
+                if p.is_matugen
+                else "ansicyan bold reverse"
+            ),
+            "picker.item": p.foreground if p.is_matugen else "",
+            "picker.num": f"{p.secondary} bold" if p.is_matugen else "bold",
+            "picker.active": f"{p.accent} bold" if p.is_matugen else "ansigreen bold",
+            "picker.effort_label": f"{p.secondary}" if p.is_matugen else "ansicyan",
+            "picker.effort_active": (
+                f"bg:{p.selection_bg} {p.accent} bold"
+                if p.is_matugen
+                else "ansigreen bold"
+            ),
+            "picker.desc": p.muted if p.is_matugen else "dim",
+            "picker.hint": f"{p.muted} italic" if p.is_matugen else "dim italic",
+        }
+    )
+
+    app: Application[tuple[str, str] | None] = Application(
+        layout=Layout(Window(content=FormattedTextControl(_render_menu), always_hide_cursor=True)),
+        key_bindings=kb,
+        style=picker_style,
+        full_screen=False,
+    )
+    return app, state
+
+
 async def prompt_model_switch_dialog(
     client: VertexAgentClient,
     billing_project: str,
 ) -> str | None:
     """
-    Renders an interactive 'Switch Model' window card with Effort slider and selection,
-    focusing on Gemini 3.8 Flash, Gemini 3.1 Pro, and the Gemini 4 element series.
+    Renders an interactive 'Switch Model' selector supporting arrow keys (↑/↓),
+    number shortcuts (1-6), Enter, and Esc in TTY terminals, with text fallback for non-TTY.
     """
     catalog = await fetch_model_garden_catalog(billing_project=billing_project)
     canonical_keys = [
@@ -450,30 +913,55 @@ async def prompt_model_switch_dialog(
         "gemini-4-argon": "Next-generation reasoning, multimodal & complex synthesis (Effort: high)",
     }
 
+    # Interactive arrow-key (↑/↓ model, ←/→ effort) & number-key selector in real TTY
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            app, _ = _build_model_picker_app(
+                gemini_models=gemini_models,
+                descriptions=descriptions,
+                active_model=client.model_name,
+                active_effort=getattr(client, "effort", "medium"),
+                palette=load_matugen_palette(),
+            )
+            res = await app.run_async()
+            if res is None:
+                return None
+            chosen_model, chosen_effort = res
+            client.set_effort(chosen_effort)
+            save_effort_to_config(chosen_effort)
+            return chosen_model
+        except Exception:
+            pass
+
+    p = load_matugen_palette()
+    c_primary = p.primary if p.is_matugen else "cyan"
+    c_accent = p.accent if p.is_matugen else "green"
+    c_border = p.border if p.is_matugen else "cyan"
+
     content = Text()
     content.append("Search / Select Model:\n", style="bold")
     content.append("─" * 60 + "\n\n", style="dim")
 
     for idx, m in enumerate(gemini_models, 1):
         is_curr = m.short_name == client.model_name or m.model_id == client.model_name
-        curr_badge = " [bold green](current)[/bold green]" if is_curr else ""
+        curr_badge = f" [bold {c_accent}](current)[/bold {c_accent}]" if is_curr else ""
         prefix = " > " if is_curr else "   "
-        style_num = "bold cyan" if is_curr else "bold white"
+        style_num = f"bold {c_primary}" if is_curr else "bold white"
         content.append(f"{prefix}[{idx}] ", style=style_num)
-        content.append(f"{m.short_name}", style="bold cyan" if is_curr else "bold")
+        content.append(f"{m.short_name}", style=f"bold {c_primary}" if is_curr else "bold")
         content.append(f"{curr_badge}\n")
         desc = descriptions.get(m.short_name, "Google Vertex AI foundation model")
         content.append(f"       {desc}\n\n", style="dim")
 
-    content.append("Effort  ◀ ───●───◎───○───▶\n", style="dim cyan")
+    content.append("Effort  ◀ ───●───◎───○───▶\n", style=f"dim {c_primary}")
     content.append("            low  medium  high\n", style="dim")
     content.append(f"Select a number [1-{len(gemini_models)}] or type name (Enter to cancel)", style="dim italic")
 
     console.print(
         Panel(
             content,
-            title="[bold cyan]Switch Model[/bold cyan]",
-            border_style="cyan",
+            title=f"[bold {c_primary}]Switch Model[/bold {c_primary}]",
+            border_style=c_border,
             box=box.ROUNDED,
         )
     )
@@ -541,6 +1029,192 @@ def make_security_policy(auto_approve: bool = False) -> SecurityPolicy:
     return policy
 
 
+_LATEX_SYMBOL_MAP: dict[str, str] = {
+    # Arrows
+    "rightarrow": "→",
+    "to": "→",
+    "leftarrow": "←",
+    "gets": "←",
+    "leftrightarrow": "↔",
+    "Rightarrow": "⇒",
+    "implies": "⇒",
+    "Leftarrow": "⇐",
+    "Leftrightarrow": "⇔",
+    "iff": "⇔",
+    "uparrow": "↑",
+    "downarrow": "↓",
+    "updownarrow": "↕",
+    "mapsto": "↦",
+    "longrightarrow": "⟶",
+    "longleftarrow": "⟵",
+    "Longrightarrow": "⟹",
+    "Longleftarrow": "⟸",
+    # Math operators & relations
+    "times": "×",
+    "div": "÷",
+    "pm": "±",
+    "mp": "∓",
+    "cdot": "·",
+    "ast": "∗",
+    "neq": "≠",
+    "ne": "≠",
+    "leq": "≤",
+    "le": "≤",
+    "geq": "≥",
+    "ge": "≥",
+    "approx": "≈",
+    "equiv": "≡",
+    "sim": "∼",
+    "simeq": "≃",
+    "cong": "≅",
+    "propto": "∝",
+    "infty": "∞",
+    "dots": "…",
+    "ldots": "…",
+    "cdots": "⋯",
+    "vdots": "⋮",
+    "ddots": "⋱",
+    "partial": "∂",
+    "nabla": "∇",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "degree": "°",
+    # Logic & sets
+    "in": "∈",
+    "notin": "∉",
+    "subset": "⊂",
+    "subseteq": "⊆",
+    "supset": "⊃",
+    "supseteq": "⊇",
+    "cup": "∪",
+    "cap": "∩",
+    "emptyset": "∅",
+    "varnothing": "∅",
+    "forall": "∀",
+    "exists": "∃",
+    "neg": "¬",
+    "lnot": "¬",
+    "land": "∧",
+    "lor": "∨",
+    "therefore": "∴",
+    "because": "∵",
+    "checkmark": "✓",
+    # Greek letters
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "upsilon": "υ",
+    "phi": "φ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
+
+_SUPERSCRIPT_MAP = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUBSCRIPT_MAP = str.maketrans("0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
+
+_LATEX_CMD_RE = re.compile(r"\\([A-Za-z]+)")
+_INLINE_CODE_SPLIT_RE = re.compile(r"(`[^`]+`)")
+_MATH_BLOCK_RE = re.compile(
+    r"\$\$(.+?)\$\$|\\\((.+?)\\\)|\\\[(.+?)\\\]|\$(?!\s)([^$\n]+?)(?<!\s)\$",
+    re.DOTALL,
+)
+
+
+def _convert_latex_expr(expr: str) -> str:
+    """Converts a LaTeX math expression into clean terminal-friendly Unicode."""
+    out = expr.strip()
+    # Unwrap common text/style wrappers like \text{...}, \mathrm{...}, \mathbf{...}
+    out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname|bf|rm)\{([^{}]*)\}", r"\1", out)
+    # \frac{a}{b} -> a/b or (a)/(b)
+    def _replace_frac(m: re.Match[str]) -> str:
+        num, den = m.group(1).strip(), m.group(2).strip()
+        n_str = num if len(num) <= 2 or num.isalnum() else f"({num})"
+        d_str = den if len(den) <= 2 or den.isalnum() else f"({den})"
+        return f"{n_str}/{d_str}"
+
+    out = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", _replace_frac, out)
+    out = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", out)
+    # Replace known LaTeX symbol commands
+    out = _LATEX_CMD_RE.sub(lambda m: _LATEX_SYMBOL_MAP.get(m.group(1), m.group(0)), out)
+    # Simple superscripts and subscripts
+    out = re.sub(r"\^\{([0-9+\-=()ni]+)\}", lambda m: m.group(1).translate(_SUPERSCRIPT_MAP), out)
+    out = re.sub(r"\^([0-9ni])", lambda m: m.group(1).translate(_SUPERSCRIPT_MAP), out)
+    out = re.sub(
+        r"_\{([0-9+\-=()aehijklmnoprstuvx]+)\}",
+        lambda m: m.group(1).translate(_SUBSCRIPT_MAP),
+        out,
+    )
+    out = re.sub(r"_([0-9ijkmn])", lambda m: m.group(1).translate(_SUBSCRIPT_MAP), out)
+    # Remove LaTeX spacing commands (\, \; \: \!)
+    out = re.sub(r"\\[,;:!]", " ", out)
+    return out
+
+
+def render_latex_unicode(text: str) -> str:
+    """
+    Replaces inline/display LaTeX math notations (such as $\\rightarrow$, $\\leq$, $O(n^2)$)
+    with clean Unicode symbols while preserving inline code spans and currency values.
+    """
+    if "$" not in text and "\\" not in text:
+        return text
+
+    parts = _INLINE_CODE_SPLIT_RE.split(text)
+    rendered_parts: list[str] = []
+
+    for idx, segment in enumerate(parts):
+        # Odd indices are inline `code` spans — leave untouched
+        if idx % 2 == 1:
+            rendered_parts.append(segment)
+            continue
+
+        def _replace_math(m: re.Match[str]) -> str:
+            raw_match = m.group(0)
+            inner = m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""
+            # For single-$ delimiters, avoid eating currency ranges like "$10 and $20"
+            if m.group(4) is not None:
+                has_latex_syntax = (
+                    "\\" in inner
+                    or "^" in inner
+                    or "_" in inner
+                    or any(op in inner for op in ("=", "<", ">", "≈", "≠", "≤", "≥"))
+                )
+                if not has_latex_syntax:
+                    return raw_match
+            return _convert_latex_expr(inner)
+
+        rendered_parts.append(_MATH_BLOCK_RE.sub(_replace_math, segment))
+
+    return "".join(rendered_parts)
+
+
 class RichMarkdownStreamer:
     """
     Streams assistant responses progressively to the terminal with Rich Markdown interpretation,
@@ -561,6 +1235,8 @@ class RichMarkdownStreamer:
         self._live = None
 
     def on_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
         if not self._header_shown and self.prompt_label:
             self.console.print(self.prompt_label, end="")
             self._header_shown = True
@@ -619,7 +1295,7 @@ class RichMarkdownStreamer:
                 if code_start != -1:
                     before = self._buffer[:code_start].strip()
                     if before:
-                        self.console.print(Markdown(before))
+                        self.console.print(Markdown(render_latex_unicode(before)))
                     self._buffer = self._buffer[code_start:]
                     self._in_code_block = True
                     continue
@@ -630,7 +1306,7 @@ class RichMarkdownStreamer:
                     block = self._buffer[:dnl].strip()
                     self._buffer = self._buffer[dnl + 2 :]
                     if block:
-                        self.console.print(Markdown(block))
+                        self.console.print(Markdown(render_latex_unicode(block)))
                     continue
 
                 # Header line or divider ending with newline
@@ -638,7 +1314,7 @@ class RichMarkdownStreamer:
                 if nl != -1:
                     line = self._buffer[:nl].strip()
                     if line.startswith("#") or line in ("---", "***", "___"):
-                        self.console.print(Markdown(line))
+                        self.console.print(Markdown(render_latex_unicode(line)))
                         self._buffer = self._buffer[nl + 1 :]
                         continue
 
@@ -646,7 +1322,7 @@ class RichMarkdownStreamer:
                 if finalize:
                     rem = self._buffer.strip()
                     if rem:
-                        self.console.print(Markdown(rem))
+                        self.console.print(Markdown(render_latex_unicode(rem)))
                     self._buffer = ""
                 break
             else:
@@ -677,6 +1353,23 @@ async def run_interactive(
     resume_session_id: str | None = None,
     continue_last: bool = False,
 ) -> None:
+    with AlternateScreenWorkspace():
+        await _run_interactive_session(
+            auto_approve=auto_approve,
+            model_override=model_override,
+            max_turns=max_turns,
+            resume_session_id=resume_session_id,
+            continue_last=continue_last,
+        )
+
+
+async def _run_interactive_session(
+    auto_approve: bool = False,
+    model_override: str | None = None,
+    max_turns: int | None = None,
+    resume_session_id: str | None = None,
+    continue_last: bool = False,
+) -> None:
     cfg = load_config()
     model = model_override or cfg.model
     memory_store = MemoryStore()
@@ -684,24 +1377,16 @@ async def run_interactive(
     project_key = resolve_project_key()
     security_policy = make_security_policy(auto_approve=auto_approve or cfg.auto_approve)
     circuit_breaker = QuotaCircuitBreaker()
-    t2_model = "gemini-3.8-flash" if model != "gemini-3.8-flash" else "gemini-3.7-flash"
-    t3_model = "gemini-3.7-flash" if model != "gemini-3.7-flash" else "gemini-3.8-flash"
-    fallback_router = FallbackRouter(
-        circuit_breaker,
-        [
-            ModelEndpoint(model, cfg.location, tier=1),
-            ModelEndpoint(t2_model, "global", tier=2),
-            ModelEndpoint(t3_model, "global", tier=3),
-        ],
-    )
     client = VertexAgentClient(
         project_id=cfg.project,
         location=cfg.location,
         model_name=model,
         memory_store=memory_store,
         security_policy=security_policy,
-        fallback_router=fallback_router,
+        fallback_router=None,
         circuit_breaker=circuit_breaker,
+        timeout=cfg.timeout,
+        effort=cfg.effort,
     )
 
     active_session_id: str = generate_session_id()
@@ -775,10 +1460,13 @@ async def run_interactive(
     )
 
     DEFAULT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    pending_images: list[ImageAttachment] = []
+    input_kb = build_input_key_bindings(pending_images)
     session: PromptSession[str] = PromptSession(
         history=FileHistory(str(DEFAULT_HISTORY_FILE)),
         completer=command_completer,
         style=pt_style,
+        key_bindings=input_kb,
     )
 
     def on_tool_call(name: str, args: dict[str, Any]) -> None:
@@ -810,7 +1498,7 @@ async def run_interactive(
         if max_turns is not None and turns_completed >= max_turns:
             break
         try:
-            w = max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+            w = max(20, shutil.get_terminal_size((80, 24)).columns)
 
             def get_bottom_toolbar() -> AnyFormattedText:
                 term_w = shutil.get_terminal_size((80, 24)).columns
@@ -818,6 +1506,8 @@ async def run_interactive(
                     terminal_width=term_w,
                     auto_approve=security_policy.auto_approve,
                     model_name=client.model_name,
+                    image_count=len(pending_images),
+                    effort=getattr(client, "effort", None),
                 )
 
             top_border = f"\n{'─' * w}\n"
@@ -829,7 +1519,7 @@ async def run_interactive(
                 )
             ).strip()
             if user_input:
-                term_w = max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+                term_w = max(20, shutil.get_terminal_size((80, 24)).columns)
                 console.print(f"[dim]{'─' * term_w}[/dim]")
         except (KeyboardInterrupt, EOFError):
             if conversation_history:
@@ -905,6 +1595,7 @@ async def run_interactive(
 
         if user_input == "/clear":
             conversation_history.clear()
+            pending_images.clear()
             active_session_id = generate_session_id()
             console.print(
                 "[dim cyan]Conversation history cleared. Started fresh session: "
@@ -1012,7 +1703,8 @@ async def run_interactive(
                     client.switch_model(chosen_model)
                     save_model_to_config(chosen_model)
                     console.print(
-                        f"[bold green]✔ Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] [dim](publisher: {client.publisher})[/dim]"
+                        f"[bold green]✔ Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] "
+                        f"[dim](publisher: {client.publisher} • effort: {getattr(client, 'effort', 'medium')})[/dim]"
                     )
             elif arg == "refresh":
                 with console.status(
@@ -1044,6 +1736,36 @@ async def run_interactive(
                 save_model_to_config(target_model)
                 console.print(
                     f"[bold green]Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] [dim](publisher: {client.publisher})[/dim]"
+                )
+            continue
+
+        if user_input.startswith("/effort"):
+            parts = user_input.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if not arg:
+                chosen_model = await prompt_model_switch_dialog(
+                    client=client, billing_project=client.project_id
+                )
+                if chosen_model:
+                    if chosen_model != client.model_name:
+                        client.switch_model(chosen_model)
+                        save_model_to_config(chosen_model)
+                    eff = getattr(client, "effort", "medium")
+                    console.print(
+                        f"[bold green]✔ Active model & effort:[/bold green] "
+                        f"[bold cyan]{client.model_name}[/bold cyan] [dim]•[/dim] "
+                        f"[bold yellow]{eff}[/bold yellow] [dim](thinkingLevel={eff.upper()})[/dim]"
+                    )
+            elif arg in VALID_EFFORT_LEVELS:
+                eff = client.set_effort(arg)
+                save_effort_to_config(eff)
+                console.print(
+                    f"[bold green]✔ Thinking effort set to:[/bold green] "
+                    f"[bold cyan]{eff}[/bold cyan] [dim](thinkingLevel={eff.upper()})[/dim]"
+                )
+            else:
+                console.print(
+                    "[dim]Usage: [bold]/effort[/bold] (interactive slider) or [bold]/effort low|medium|high[/bold][/dim]"
                 )
             continue
 
@@ -1546,7 +2268,8 @@ async def run_interactive(
                 " - [bold]/memories[/bold]: List persistent memories for current workspace\n"
                 " - [bold]/compact[/bold]: Compact conversation context\n"
                 " - [bold]/doctor[/bold]: Verify authentication, database, AST index, and workspace health\n"
-                " - [bold]/model <name>[/bold]: Switch or inspect model\n"
+                " - [bold]/model <name>[/bold]: Switch or inspect model (↑/↓ model, ←/→ effort)\n"
+                " - [bold]/effort [low|medium|high][/bold]: Adjust real AI thinking effort (thinkingLevel)\n"
                 " - [bold]/index[/bold]: Re-index workspace code AST symbols and relations\n"
                 " - [bold]/search <query>[/bold]: Hybrid BM25 + vector search with Reciprocal Rank Fusion\n"
                 " - [bold]/sandbox [on|diff|apply|discard][/bold]: Manage isolated Git worktree sandboxing\n"
@@ -1561,29 +2284,92 @@ async def run_interactive(
             )
             continue
 
-        conversation_history.append({"role": "user", "parts": [{"text": user_input}]})
+        attached_images = [img for img in pending_images if img.token in user_input]
+        pending_images.clear()
+        user_parts: list[dict[str, Any]] = [{"text": user_input}]
+        if attached_images:
+            summary_items = ", ".join(
+                f"{img.token} ({img.mime_type}, {img.size_label})" for img in attached_images
+            )
+            console.print(f"[dim cyan]🖼 Attached {len(attached_images)} image(s): {summary_items}[/dim cyan]")
+            for img in attached_images:
+                user_parts.append(img.to_gemini_part())
+
+        conversation_history.append({"role": "user", "parts": user_parts})
         conversation_history = compact_history(conversation_history, max_turns=12, keep_recent=6)
 
         streamer = RichMarkdownStreamer(console=console)
+        pinned_footer = PinnedFooterManager()
+        status = console.status("[dim cyan]Thinking...[/dim cyan]", spinner="dots")
+        status_active = False
+
+        def _handle_tool_call(
+            name: str,
+            args: dict[str, Any],
+            _status: Any = status,
+            _streamer: RichMarkdownStreamer = streamer,
+            _footer: PinnedFooterManager = pinned_footer,
+        ) -> None:
+            nonlocal status_active
+            if status_active:
+                _status.stop()
+                status_active = False
+            _footer.update(
+                activity=f"⚡ Tool: {name}",
+                auto_approve=security_policy.auto_approve,
+                model_name=client.model_name,
+                effort=getattr(client, "effort", None),
+            )
+            _streamer.on_tool_call(name, args)
+
         try:
-            with console.status("[dim cyan]Thinking...[/dim cyan]", spinner="dots"):
-                stream_iter = client.stream_chat(
-                    conversation_history, on_tool_call=streamer.on_tool_call
-                )
-                try:
-                    first_chunk = await stream_iter.__anext__()
-                except StopAsyncIteration:
-                    first_chunk = None
+            pinned_footer.pin(
+                activity="● Thinking...",
+                auto_approve=security_policy.auto_approve,
+                model_name=client.model_name,
+                effort=getattr(client, "effort", None),
+            )
+            status.start()
+            status_active = True
+            stream_iter = client.stream_chat(
+                conversation_history, on_tool_call=_handle_tool_call
+            )
+            try:
+                first_chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                first_chunk = None
+            finally:
+                if status_active:
+                    status.stop()
+                    status_active = False
+
             if first_chunk is not None:
+                pinned_footer.update(
+                    activity="● Streaming response...",
+                    auto_approve=security_policy.auto_approve,
+                    model_name=client.model_name,
+                    effort=getattr(client, "effort", None),
+                )
                 streamer.on_chunk(first_chunk)
                 async for chunk in stream_iter:
                     streamer.on_chunk(chunk)
             full_response = streamer.finalize()
         except Exception as e:
+            if status_active:
+                status.stop()
+                status_active = False
             if streamer._live is not None:
                 streamer._live.stop()
-            console.print(f"\n[bold red]Error:[/bold red] {e}")
+            # Remove unanswered user turn so it doesn't corrupt subsequent prompts
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            console.print(
+                f"\n[bold red]✖ No hubo respuesta del modelo '[bold]{client.model_name}[/bold]':[/bold red] {e}\n"
+                "[bold yellow]→ Cambia de modelo con [bold]/model[/bold] para continuar.[/bold yellow]"
+            )
             continue
+        finally:
+            pinned_footer.unpin()
 
         if full_response.strip():
             conversation_history.append({"role": "model", "parts": [{"text": full_response}]})
@@ -1592,6 +2378,14 @@ async def run_interactive(
                 messages=conversation_history,
                 model_name=client.model_name,
                 project_key=project_key,
+            )
+        else:
+            # Remove unanswered user turn and notify the user instead of failing silently
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            console.print(
+                "[dim yellow]⚠ El modelo completó el turno sin texto de respuesta "
+                f"(modelo activo: [bold]{client.model_name}[/bold]). Intenta reformular o cambiar de modelo con [bold]/model[/bold].[/dim yellow]"
             )
 
 
@@ -1636,24 +2430,16 @@ async def run_oneshot(
     project_key = resolve_project_key()
     security_policy = make_security_policy(auto_approve=auto_approve or cfg.auto_approve)
     circuit_breaker = QuotaCircuitBreaker()
-    t2_model = "gemini-3.8-flash" if model != "gemini-3.8-flash" else "gemini-3.7-flash"
-    t3_model = "gemini-3.7-flash" if model != "gemini-3.7-flash" else "gemini-3.8-flash"
-    fallback_router = FallbackRouter(
-        circuit_breaker,
-        [
-            ModelEndpoint(model, cfg.location, tier=1),
-            ModelEndpoint(t2_model, "global", tier=2),
-            ModelEndpoint(t3_model, "global", tier=3),
-        ],
-    )
     client = VertexAgentClient(
         project_id=cfg.project,
         location=cfg.location,
         model_name=model,
         memory_store=memory_store,
         security_policy=security_policy,
-        fallback_router=fallback_router,
+        fallback_router=None,
         circuit_breaker=circuit_breaker,
+        timeout=cfg.timeout,
+        effort=cfg.effort,
     )
 
     active_session_id: str = generate_session_id()
@@ -1702,7 +2488,10 @@ async def run_oneshot(
         if streamer._live is not None:
             streamer._live.stop()
         err_msg = str(e) or repr(e)
-        console.print(f"[bold red]Error ({type(e).__name__}):[/bold red] {err_msg}")
+        console.print(
+            f"[bold red]✖ No hubo respuesta del modelo '{client.model_name}' ({type(e).__name__}):[/bold red] {err_msg}\n"
+            "[bold yellow]→ Cambia de modelo con [bold]--model <nombre>[/bold] o [bold]/model[/bold].[/bold yellow]"
+        )
         sys.exit(1)
 
 

@@ -95,6 +95,9 @@ def estimate_context_tokens(history: list[dict[str, Any]]) -> int:
         for part in parts:
             if "text" in part and isinstance(part["text"], str):
                 total_chars += len(part["text"])
+            elif "inlineData" in part:
+                # Standard Vertex AI image token budget (~258 tokens -> ~1032 char equiv)
+                total_chars += 1032
             else:
                 total_chars += len(json.dumps(part, ensure_ascii=False, default=str))
     return max(1, total_chars // 4) if total_chars > 0 else 0
@@ -128,6 +131,9 @@ def compact_history(
                 text = p["text"].strip().replace("\n", " ")
                 preview = text[:120] + ("..." if len(text) > 120 else "")
                 summary_snippets.append(f"- [{role}]: {preview}")
+            elif "inlineData" in p:
+                mime = p["inlineData"].get("mimeType", "image")
+                summary_snippets.append(f"- [image attachment]: {mime}")
             elif "functionCall" in p:
                 fn = p["functionCall"].get("name", "tool")
                 summary_snippets.append(f"- [tool call]: {fn}")
