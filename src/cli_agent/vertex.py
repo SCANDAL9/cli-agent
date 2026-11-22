@@ -19,6 +19,7 @@ from .circuit_breaker import (
     QuotaCircuitBreaker,
 )
 from .code_graph import CodeGraphStore
+from .config import normalize_effort
 from .memory import MemoryStore, resolve_project_key
 from .models import detect_publisher
 from .security import SecurityPolicy
@@ -52,10 +53,12 @@ class VertexAgentClient:
         fallback_router: FallbackRouter | None = None,
         circuit_breaker: QuotaCircuitBreaker | None = None,
         timeout: float | httpx.Timeout | None = None,
+        effort: str = "medium",
     ):
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
+        self.effort = normalize_effort(effort)
         self.timeout = (
             timeout
             if isinstance(timeout, httpx.Timeout)
@@ -101,6 +104,18 @@ class VertexAgentClient:
         self.model_name = model_name
         self.publisher = detect_publisher(model_name)
         self._configure_endpoints()
+
+    def set_effort(self, effort: str) -> str:
+        """Updates the active reasoning effort level ('low', 'medium', 'high')."""
+        self.effort = normalize_effort(effort)
+        return self.effort
+
+    def _build_generation_config(self) -> dict[str, Any]:
+        """Builds Vertex AI generationConfig including real thinkingConfig for Gemini models."""
+        gen_cfg: dict[str, Any] = {"temperature": 0.2}
+        if self.publisher == "google":
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": self.effort.upper()}
+        return gen_cfg
 
     def _build_system_instruction(self) -> str:
         project_key = resolve_project_key()
@@ -178,7 +193,7 @@ Guidelines:
                 payload: dict[str, Any] = {
                     "contents": working_contents,
                     "system_instruction": {"parts": [{"text": active_instruction}]},
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": self._build_generation_config(),
                 }
                 if active_tools:
                     payload["tools"] = [{"function_declarations": active_tools}]
@@ -295,7 +310,7 @@ Guidelines:
                 payload: dict[str, Any] = {
                     "contents": pruned_contents,
                     "system_instruction": {"parts": [{"text": active_instruction}]},
-                    "generationConfig": {"temperature": 0.2},
+                    "generationConfig": self._build_generation_config(),
                 }
                 if active_tools:
                     payload["tools"] = [{"function_declarations": active_tools}]

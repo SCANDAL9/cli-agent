@@ -37,6 +37,17 @@ def _detect_gcp_project() -> str:
     return "my-gcp-project"
 
 
+VALID_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+
+
+def normalize_effort(value: str | None, default: str = "medium") -> str:
+    """Normalizes a reasoning effort string to one of 'low', 'medium', or 'high'."""
+    cleaned = str(value or "").strip().lower()
+    if cleaned in VALID_EFFORT_LEVELS:
+        return cleaned
+    return default
+
+
 @dataclass
 class AgentConfig:
     project: str = "my-gcp-project"
@@ -45,6 +56,7 @@ class AgentConfig:
     temperature: float = 0.2
     auto_approve: bool = False
     timeout: float = 300.0
+    effort: str = "medium"
 
 
 def load_config(config_path: Path | None = None) -> AgentConfig:
@@ -81,6 +93,9 @@ def load_config(config_path: Path | None = None) -> AgentConfig:
     except (ValueError, TypeError):
         timeout = 300.0
 
+    raw_effort = os.getenv("CLI_AGENT_EFFORT") or defaults_sec.get("effort", "medium")
+    effort = normalize_effort(str(raw_effort))
+
     return AgentConfig(
         project=project,
         location=location,
@@ -88,15 +103,12 @@ def load_config(config_path: Path | None = None) -> AgentConfig:
         temperature=temperature,
         auto_approve=auto_approve,
         timeout=timeout,
+        effort=effort,
     )
 
 
-def save_model_to_config(model_name: str, config_path: Path | None = None) -> bool:
-    """Persists the selected model name to the local TOML configuration file."""
-    clean_name = str(model_name).strip()
-    if not clean_name or "Mock" in clean_name or "<" in clean_name:
-        clean_name = "gemini-3.8-flash"
-
+def _save_default_setting(key: str, value: str, config_path: Path | None = None) -> bool:
+    """Persists a string key/value under [defaults] in the local TOML config file."""
     cfg_path = config_path or DEFAULT_CONFIG_FILE
     try:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +118,7 @@ def save_model_to_config(model_name: str, config_path: Path | None = None) -> bo
 
         lines = existing_content.splitlines()
         defaults_found = False
-        model_updated = False
+        key_updated = False
         new_lines: list[str] = []
 
         for line in lines:
@@ -114,27 +126,45 @@ def save_model_to_config(model_name: str, config_path: Path | None = None) -> bo
             if stripped == "[defaults]":
                 defaults_found = True
                 new_lines.append(line)
-            elif defaults_found and (stripped.startswith("model") and "=" in stripped):
-                new_lines.append(f'model = "{clean_name}"')
-                model_updated = True
+            elif defaults_found and stripped.startswith(key) and "=" in stripped:
+                lhs = stripped.split("=", 1)[0].strip()
+                if lhs == key:
+                    new_lines.append(f'{key} = "{value}"')
+                    key_updated = True
+                else:
+                    new_lines.append(line)
             elif stripped.startswith("[") and stripped != "[defaults]":
-                if defaults_found and not model_updated:
-                    new_lines.append(f'model = "{clean_name}"')
-                    model_updated = True
+                if defaults_found and not key_updated:
+                    new_lines.append(f'{key} = "{value}"')
+                    key_updated = True
                 defaults_found = False
                 new_lines.append(line)
             else:
                 new_lines.append(line)
 
-        if not defaults_found and not model_updated:
+        if not defaults_found and not key_updated:
             if new_lines and new_lines[-1] != "":
                 new_lines.append("")
             new_lines.append("[defaults]")
-            new_lines.append(f'model = "{clean_name}"')
-        elif defaults_found and not model_updated:
-            new_lines.append(f'model = "{clean_name}"')
+            new_lines.append(f'{key} = "{value}"')
+        elif defaults_found and not key_updated:
+            new_lines.append(f'{key} = "{value}"')
 
         cfg_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         return True
     except Exception:
         return False
+
+
+def save_model_to_config(model_name: str, config_path: Path | None = None) -> bool:
+    """Persists the selected model name to the local TOML configuration file."""
+    clean_name = str(model_name).strip()
+    if not clean_name or "Mock" in clean_name or "<" in clean_name:
+        clean_name = "gemini-3.8-flash"
+    return _save_default_setting("model", clean_name, config_path=config_path)
+
+
+def save_effort_to_config(effort: str, config_path: Path | None = None) -> bool:
+    """Persists the selected reasoning effort level ('low', 'medium', 'high') to config.toml."""
+    clean_effort = normalize_effort(effort)
+    return _save_default_setting("effort", clean_effort, config_path=config_path)

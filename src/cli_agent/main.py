@@ -41,7 +41,14 @@ from .clipboard import (
     render_kitty_image_preview,
 )
 from .code_graph import CodeGraphIndexer
-from .config import DEFAULT_HISTORY_FILE, load_config, save_model_to_config
+from .config import (
+    DEFAULT_HISTORY_FILE,
+    VALID_EFFORT_LEVELS,
+    load_config,
+    normalize_effort,
+    save_effort_to_config,
+    save_model_to_config,
+)
 from .context import compact_history, extract_session_learnings
 from .doctor import run_diagnostics
 from .mcp import MCPRegistry, set_active_mcp_registry
@@ -79,6 +86,7 @@ SLASH_COMMANDS = [
     "/setup",
     "/model",
     "/models",
+    "/effort",
     "/index",
     "/search",
     "/sandbox",
@@ -106,6 +114,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/setup": "Launch GCP project onboarding wizard",
     "/model": "Switch or inspect active Vertex AI model",
     "/models": "Explore Vertex AI Model Garden catalog",
+    "/effort": "Adjust AI thinking effort (low / medium / high)",
     "/index": "Re-index workspace code AST symbols",
     "/search": "Hybrid BM25 + dense vector code search",
     "/sandbox": "Manage isolated Git worktree sandbox",
@@ -171,6 +180,7 @@ def format_bottom_toolbar(
     auto_approve: bool,
     model_name: str,
     image_count: int = 0,
+    effort: str | None = None,
 ) -> FormattedText:
     """Formats the REPL bottom toolbar with terminal-adaptive styling (no inverse contrast)."""
     term_w = max(20, terminal_width)
@@ -182,7 +192,7 @@ def format_bottom_toolbar(
         else "class:bottom-toolbar.badge.default"
     )
     model_disp = _format_model_badge(model_name)
-    effort_disp = _get_model_effort(model_name)
+    effort_disp = normalize_effort(effort) if effort else _get_model_effort(model_name)
     img_prefix = f"🖼 {image_count} img • " if image_count > 0 else ""
     status_text = f"{img_prefix}{mode_str} • {model_disp} • {effort_disp}"
     pad = " " * max(0, term_w - len(status_text) - 1)
@@ -267,12 +277,13 @@ class PinnedFooterManager:
         auto_approve: bool,
         model_name: str,
         image_count: int = 0,
+        effort: str | None = None,
     ) -> None:
         cols, rows = self._cols, self._rows
         border = "─" * cols
         mode_str = "auto" if auto_approve else "default"
         model_disp = _format_model_badge(model_name)
-        effort_disp = _get_model_effort(model_name)
+        effort_disp = normalize_effort(effort) if effort else _get_model_effort(model_name)
         img_prefix = f"🖼 {image_count} img • " if image_count > 0 else ""
         right_text = f"{img_prefix}{mode_str} • {model_disp} • {effort_disp}"
         left_text = activity.strip()
@@ -320,6 +331,7 @@ class PinnedFooterManager:
         auto_approve: bool,
         model_name: str,
         image_count: int = 0,
+        effort: str | None = None,
     ) -> None:
         """Locks bottom 2 rows with DECSTBM scroll region and paints the pinned footer."""
         if not self._enabled:
@@ -334,6 +346,7 @@ class PinnedFooterManager:
             auto_approve=auto_approve,
             model_name=model_name,
             image_count=image_count,
+            effort=effort,
         )
 
     def update(
@@ -342,6 +355,7 @@ class PinnedFooterManager:
         auto_approve: bool,
         model_name: str,
         image_count: int = 0,
+        effort: str | None = None,
     ) -> None:
         """Updates the pinned footer text without moving the main scroll cursor."""
         if not self._enabled or not self._pinned:
@@ -352,6 +366,7 @@ class PinnedFooterManager:
             auto_approve=auto_approve,
             model_name=model_name,
             image_count=image_count,
+            effort=effort,
         )
 
     def unpin(self) -> None:
@@ -704,11 +719,16 @@ def _build_model_picker_app(
     gemini_models: list[ModelCatalogEntry],
     descriptions: dict[str, str],
     active_model: str,
+    active_effort: str = "medium",
     palette: MatugenPalette | None = None,
-) -> tuple[Application[str | None], dict[str, int]]:
+) -> tuple[Application[tuple[str, str] | None], dict[str, int]]:
     """
-    Builds an interactive prompt_toolkit Application allowing arrow-key (↑/↓, j/k),
-    direct number-key (1-9), Enter, and Esc navigation over the Gemini model catalog.
+    Builds an interactive prompt_toolkit Application allowing:
+    - ↑/↓ (or k/j): navigate models
+    - ←/→ (or h/l): slide real thinking effort (low / medium / high) directly under the hovered model
+    - 1-9: quick-select model with current effort
+    - Enter: confirm selected model + effort
+    - Esc / q / Ctrl+C: cancel
     """
     p = palette or load_matugen_palette()
     initial_idx = 0
@@ -717,14 +737,30 @@ def _build_model_picker_app(
             initial_idx = idx
             break
 
-    state: dict[str, int] = {"selected": initial_idx}
+    norm_eff = normalize_effort(active_effort)
+    initial_eff_idx = VALID_EFFORT_LEVELS.index(norm_eff)
+    state: dict[str, int] = {"selected": initial_idx, "effort_idx": initial_eff_idx}
+
+    def _render_effort_slider(eff_idx: int) -> list[tuple[str, str]]:
+        """Renders an interactive horizontal slider bar for low / medium / high effort."""
+        parts: list[tuple[str, str]] = [("class:picker.effort_label", "       Effort  ◀ ")]
+        for i, level in enumerate(VALID_EFFORT_LEVELS):
+            if i > 0:
+                parts.append(("class:picker.border", "───"))
+            if i == eff_idx:
+                parts.append(("class:picker.effort_active", f"[● {level}]"))
+            else:
+                parts.append(("class:picker.desc", f"○ {level}"))
+        parts.append(("class:picker.effort_label", " ▶  (←/→)\n"))
+        return parts
 
     def _render_menu() -> FormattedText:
         sel = state["selected"]
+        eff_idx = state["effort_idx"]
         term_w = max(50, shutil.get_terminal_size((80, 24)).columns)
         sep = "─" * min(term_w - 4, 72)
         fragments: list[tuple[str, str]] = [
-            ("class:picker.title", "  ❖ Switch Model\n"),
+            ("class:picker.title", "  ❖ Switch Model & Thinking Effort\n"),
             ("class:picker.border", f"  {sep}\n"),
         ]
         for idx, m in enumerate(gemini_models):
@@ -743,12 +779,14 @@ def _build_model_picker_app(
                 fragments.append(("class:picker.active", curr_tag))
             fragments.append(("", "\n"))
             fragments.append(("class:picker.desc", f"       {desc}\n"))
+            if is_sel:
+                fragments.extend(_render_effort_slider(eff_idx))
 
         fragments.append(("class:picker.border", f"  {sep}\n"))
         fragments.append(
             (
                 "class:picker.hint",
-                f"  ↑/↓ navigate  •  1-{len(gemini_models)} quick select  •  Enter confirm  •  Esc cancel\n",
+                f"  ↑/↓ model  •  ←/→ effort  •  1-{len(gemini_models)} quick pick  •  Enter confirm  •  Esc cancel\n",
             )
         )
         return FormattedText(fragments)
@@ -765,9 +803,21 @@ def _build_model_picker_app(
     def _move_down(event: Any) -> None:
         state["selected"] = (state["selected"] + 1) % len(gemini_models)
 
+    @kb.add("left")
+    @kb.add("h")
+    def _effort_left(event: Any) -> None:
+        state["effort_idx"] = max(0, state["effort_idx"] - 1)
+
+    @kb.add("right")
+    @kb.add("l")
+    def _effort_right(event: Any) -> None:
+        state["effort_idx"] = min(len(VALID_EFFORT_LEVELS) - 1, state["effort_idx"] + 1)
+
     @kb.add("enter")
     def _confirm(event: Any) -> None:
-        event.app.exit(result=gemini_models[state["selected"]].short_name)
+        chosen_model = gemini_models[state["selected"]].short_name
+        chosen_effort = VALID_EFFORT_LEVELS[state["effort_idx"]]
+        event.app.exit(result=(chosen_model, chosen_effort))
 
     @kb.add("escape")
     @kb.add("q")
@@ -779,7 +829,8 @@ def _build_model_picker_app(
         def _make_num_handler(target_i: int) -> Any:
             def _pick_num(event: Any) -> None:
                 state["selected"] = target_i
-                event.app.exit(result=gemini_models[target_i].short_name)
+                chosen_effort = VALID_EFFORT_LEVELS[state["effort_idx"]]
+                event.app.exit(result=(gemini_models[target_i].short_name, chosen_effort))
 
             return _pick_num
 
@@ -797,12 +848,18 @@ def _build_model_picker_app(
             "picker.item": p.foreground if p.is_matugen else "",
             "picker.num": f"{p.secondary} bold" if p.is_matugen else "bold",
             "picker.active": f"{p.accent} bold" if p.is_matugen else "ansigreen bold",
+            "picker.effort_label": f"{p.secondary}" if p.is_matugen else "ansicyan",
+            "picker.effort_active": (
+                f"bg:{p.selection_bg} {p.accent} bold"
+                if p.is_matugen
+                else "ansigreen bold"
+            ),
             "picker.desc": p.muted if p.is_matugen else "dim",
             "picker.hint": f"{p.muted} italic" if p.is_matugen else "dim italic",
         }
     )
 
-    app: Application[str | None] = Application(
+    app: Application[tuple[str, str] | None] = Application(
         layout=Layout(Window(content=FormattedTextControl(_render_menu), always_hide_cursor=True)),
         key_bindings=kb,
         style=picker_style,
@@ -856,16 +913,23 @@ async def prompt_model_switch_dialog(
         "gemini-4-argon": "Next-generation reasoning, multimodal & complex synthesis (Effort: high)",
     }
 
-    # Interactive arrow-key & number-key selector when running in a real interactive TTY
+    # Interactive arrow-key (↑/↓ model, ←/→ effort) & number-key selector in real TTY
     if sys.stdin.isatty() and sys.stdout.isatty():
         try:
             app, _ = _build_model_picker_app(
                 gemini_models=gemini_models,
                 descriptions=descriptions,
                 active_model=client.model_name,
+                active_effort=getattr(client, "effort", "medium"),
                 palette=load_matugen_palette(),
             )
-            return await app.run_async()
+            res = await app.run_async()
+            if res is None:
+                return None
+            chosen_model, chosen_effort = res
+            client.set_effort(chosen_effort)
+            save_effort_to_config(chosen_effort)
+            return chosen_model
         except Exception:
             pass
 
@@ -1322,6 +1386,7 @@ async def _run_interactive_session(
         fallback_router=None,
         circuit_breaker=circuit_breaker,
         timeout=cfg.timeout,
+        effort=cfg.effort,
     )
 
     active_session_id: str = generate_session_id()
@@ -1442,6 +1507,7 @@ async def _run_interactive_session(
                     auto_approve=security_policy.auto_approve,
                     model_name=client.model_name,
                     image_count=len(pending_images),
+                    effort=getattr(client, "effort", None),
                 )
 
             top_border = f"\n{'─' * w}\n"
@@ -1637,7 +1703,8 @@ async def _run_interactive_session(
                     client.switch_model(chosen_model)
                     save_model_to_config(chosen_model)
                     console.print(
-                        f"[bold green]✔ Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] [dim](publisher: {client.publisher})[/dim]"
+                        f"[bold green]✔ Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] "
+                        f"[dim](publisher: {client.publisher} • effort: {getattr(client, 'effort', 'medium')})[/dim]"
                     )
             elif arg == "refresh":
                 with console.status(
@@ -1669,6 +1736,36 @@ async def _run_interactive_session(
                 save_model_to_config(target_model)
                 console.print(
                     f"[bold green]Switched active model to:[/bold green] [bold cyan]{client.model_name}[/bold cyan] [dim](publisher: {client.publisher})[/dim]"
+                )
+            continue
+
+        if user_input.startswith("/effort"):
+            parts = user_input.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if not arg:
+                chosen_model = await prompt_model_switch_dialog(
+                    client=client, billing_project=client.project_id
+                )
+                if chosen_model:
+                    if chosen_model != client.model_name:
+                        client.switch_model(chosen_model)
+                        save_model_to_config(chosen_model)
+                    eff = getattr(client, "effort", "medium")
+                    console.print(
+                        f"[bold green]✔ Active model & effort:[/bold green] "
+                        f"[bold cyan]{client.model_name}[/bold cyan] [dim]•[/dim] "
+                        f"[bold yellow]{eff}[/bold yellow] [dim](thinkingLevel={eff.upper()})[/dim]"
+                    )
+            elif arg in VALID_EFFORT_LEVELS:
+                eff = client.set_effort(arg)
+                save_effort_to_config(eff)
+                console.print(
+                    f"[bold green]✔ Thinking effort set to:[/bold green] "
+                    f"[bold cyan]{eff}[/bold cyan] [dim](thinkingLevel={eff.upper()})[/dim]"
+                )
+            else:
+                console.print(
+                    "[dim]Usage: [bold]/effort[/bold] (interactive slider) or [bold]/effort low|medium|high[/bold][/dim]"
                 )
             continue
 
@@ -2171,7 +2268,8 @@ async def _run_interactive_session(
                 " - [bold]/memories[/bold]: List persistent memories for current workspace\n"
                 " - [bold]/compact[/bold]: Compact conversation context\n"
                 " - [bold]/doctor[/bold]: Verify authentication, database, AST index, and workspace health\n"
-                " - [bold]/model <name>[/bold]: Switch or inspect model\n"
+                " - [bold]/model <name>[/bold]: Switch or inspect model (↑/↓ model, ←/→ effort)\n"
+                " - [bold]/effort [low|medium|high][/bold]: Adjust real AI thinking effort (thinkingLevel)\n"
                 " - [bold]/index[/bold]: Re-index workspace code AST symbols and relations\n"
                 " - [bold]/search <query>[/bold]: Hybrid BM25 + vector search with Reciprocal Rank Fusion\n"
                 " - [bold]/sandbox [on|diff|apply|discard][/bold]: Manage isolated Git worktree sandboxing\n"
@@ -2220,6 +2318,7 @@ async def _run_interactive_session(
                 activity=f"⚡ Tool: {name}",
                 auto_approve=security_policy.auto_approve,
                 model_name=client.model_name,
+                effort=getattr(client, "effort", None),
             )
             _streamer.on_tool_call(name, args)
 
@@ -2228,6 +2327,7 @@ async def _run_interactive_session(
                 activity="● Thinking...",
                 auto_approve=security_policy.auto_approve,
                 model_name=client.model_name,
+                effort=getattr(client, "effort", None),
             )
             status.start()
             status_active = True
@@ -2248,6 +2348,7 @@ async def _run_interactive_session(
                     activity="● Streaming response...",
                     auto_approve=security_policy.auto_approve,
                     model_name=client.model_name,
+                    effort=getattr(client, "effort", None),
                 )
                 streamer.on_chunk(first_chunk)
                 async for chunk in stream_iter:
@@ -2338,6 +2439,7 @@ async def run_oneshot(
         fallback_router=None,
         circuit_breaker=circuit_breaker,
         timeout=cfg.timeout,
+        effort=cfg.effort,
     )
 
     active_session_id: str = generate_session_id()

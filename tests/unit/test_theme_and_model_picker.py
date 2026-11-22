@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from cli_agent.config import load_config, normalize_effort, save_effort_to_config
 from cli_agent.main import _build_model_picker_app
 from cli_agent.models import ModelCatalogEntry
 from cli_agent.theme import (
@@ -19,6 +20,7 @@ from cli_agent.theme import (
     load_matugen_palette,
     parse_kitty_colors_file,
 )
+from cli_agent.vertex import VertexAgentClient
 
 
 @pytest.mark.unit
@@ -81,13 +83,17 @@ def test_model_picker_arrow_keys_number_shortcuts_and_cancel() -> None:
         gemini_models=models,
         descriptions={"gemini-3.8-flash": "Flash", "gemini-3.1-pro": "Pro", "gemini-4-hydrogen": "Hydrogen"},
         active_model="gemini-3.8-flash",
+        active_effort="medium",
         palette=MatugenPalette(is_matugen=False),
     )
     assert state["selected"] == 0
+    assert state["effort_idx"] == 1
 
     bindings = app.key_bindings.bindings
     down_h = next(b.handler for b in bindings if b.keys == ("down",))
     up_h = next(b.handler for b in bindings if b.keys == ("up",))
+    left_h = next(b.handler for b in bindings if b.keys == ("left",))
+    right_h = next(b.handler for b in bindings if b.keys == ("right",))
     enter_h = next(b.handler for b in bindings if b.keys == ("c-m",))
     esc_h = next(b.handler for b in bindings if b.keys == ("escape",))
     key_3_h = next(b.handler for b in bindings if b.keys == ("3",))
@@ -103,16 +109,54 @@ def test_model_picker_arrow_keys_number_shortcuts_and_cancel() -> None:
     up_h(ev)
     assert state["selected"] == 0
 
-    # Arrow down + Enter -> selects gemini-3.1-pro
+    # Left/right arrows slide effort low <-> medium <-> high (clamped)
+    right_h(ev)
+    assert state["effort_idx"] == 2  # high
+    right_h(ev)
+    assert state["effort_idx"] == 2  # clamped at high
+    left_h(ev)
+    left_h(ev)
+    assert state["effort_idx"] == 0  # low
+    left_h(ev)
+    assert state["effort_idx"] == 0  # clamped at low
+    right_h(ev)
+    right_h(ev)
+    assert state["effort_idx"] == 2  # high
+
+    # Arrow down + Enter -> selects (gemini-3.1-pro, high)
     down_h(ev)
     enter_h(ev)
-    mock_app.exit.assert_called_with(result="gemini-3.1-pro")
+    mock_app.exit.assert_called_with(result=("gemini-3.1-pro", "high"))
 
-    # Number shortcut '3' -> immediately selects gemini-4-hydrogen
+    # Number shortcut '3' -> immediately selects (gemini-4-hydrogen, high)
     key_3_h(ev)
     assert state["selected"] == 2
-    mock_app.exit.assert_called_with(result="gemini-4-hydrogen")
+    mock_app.exit.assert_called_with(result=("gemini-4-hydrogen", "high"))
 
     # Esc -> cancels with None
     esc_h(ev)
     mock_app.exit.assert_called_with(result=None)
+
+
+@pytest.mark.unit
+def test_real_effort_config_persistence_and_vertex_generation_config(tmp_path: Path) -> None:
+    assert normalize_effort("HIGH") == "high"
+    assert normalize_effort("invalid", default="low") == "low"
+
+    cfg_file = tmp_path / "config.toml"
+    assert save_effort_to_config("high", config_path=cfg_file) is True
+    loaded = load_config(config_path=cfg_file)
+    assert loaded.effort == "high"
+
+    client = VertexAgentClient(project_id="test-proj", model_name="gemini-3.8-flash", effort="low")
+    assert client._build_generation_config() == {
+        "temperature": 0.2,
+        "thinkingConfig": {"thinkingLevel": "LOW"},
+    }
+    client.set_effort("high")
+    assert client._build_generation_config()["thinkingConfig"] == {"thinkingLevel": "HIGH"}
+
+    # Non-Google publisher omits Gemini thinkingConfig
+    client.switch_model("publishers/anthropic/models/claude-sonnet-5")
+    assert "thinkingConfig" not in client._build_generation_config()
+
