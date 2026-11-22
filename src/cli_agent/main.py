@@ -54,6 +54,7 @@ from .doctor import run_diagnostics
 from .mcp import MCPRegistry, set_active_mcp_registry
 from .memory import MemoryStore, resolve_project_key
 from .models import ModelCatalogEntry, fetch_model_garden_catalog
+from .notifications import send_background_notification
 from .pr import CIWatcher, PRSynthesizer, detect_git_host_provider
 from .preflight import PreflightEngine, ProjectSelector, ServiceUsageManager
 from .search import get_hybrid_search_engine
@@ -64,6 +65,7 @@ from .team import MultiAgentTeam, set_active_team
 from .theme import (
     MatugenPalette,
     build_prompt_toolkit_style,
+    build_rich_theme,
     hex_to_ansi_fg,
     load_matugen_palette,
 )
@@ -73,7 +75,8 @@ from .vertex import VertexAgentClient
 from .voice import VoiceAgentEngine
 from .worktree import DiffViewer, WorktreeManager, WorktreeSession
 
-console = Console()
+matugen_palette: MatugenPalette = load_matugen_palette()
+console = Console(theme=build_rich_theme(matugen_palette))
 
 SLASH_COMMANDS = [
     "/auto",
@@ -171,7 +174,6 @@ command_completer: Completer = AgentInputCompleter(
     slash_completer=_slash_word_completer, path_completer=_path_completer
 )
 
-matugen_palette: MatugenPalette = load_matugen_palette()
 pt_style = build_prompt_toolkit_style(matugen_palette)
 
 
@@ -219,9 +221,12 @@ _IMAGE_TOKEN_RE = re.compile(r"\[Image #(\d+)\] ?")
 
 class AlternateScreenWorkspace:
     """
-    Isolates the interactive agent session inside the terminal's Alternate Screen Buffer
-    (DEC private mode 1049: \\x1b[?1049h on enter, \\x1b[r\\x1b[?1049l on exit).
-    Prevents scrolling back into prior shell commands and restores the original terminal cleanly.
+    Creates a clean, isolated session workspace in Kitty/ANSI terminals without disabling
+    native terminal scrollback:
+    - On enter: erases prior shell scrollback (`\\x1b[3J`), clears the viewport (`\\x1b[2J`),
+      and moves cursor home (`\\x1b[H`), so prior terminal commands cannot be scrolled back to,
+      while keeping full native mouse/keyboard scrollback for the entire kanon session.
+    - On exit: resets scroll margins (`\\x1b[r`) cleanly.
     """
 
     def __init__(self, stream: Any | None = None, enabled: bool | None = None) -> None:
@@ -234,16 +239,16 @@ class AlternateScreenWorkspace:
 
     def __enter__(self) -> "AlternateScreenWorkspace":
         if self._enabled and not self._active:
-            # Enter alternate screen buffer, clear it, and move cursor to home (1,1)
-            self._stream.write("\x1b[?1049h\x1b[2J\x1b[H")
+            # Erase prior scrollback (ED 3) + clear screen (ED 2) + home cursor
+            self._stream.write("\x1b[3J\x1b[2J\x1b[H")
             self._stream.flush()
             self._active = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._active:
-            # Reset scroll margins and leave alternate screen buffer cleanly
-            self._stream.write("\x1b[r\x1b[?1049l")
+            # Reset scroll margins cleanly
+            self._stream.write("\x1b[r")
             self._stream.flush()
             self._active = False
 
@@ -1011,6 +1016,15 @@ def make_security_policy(auto_approve: bool = False) -> SecurityPolicy:
                 border_style=border_col,
                 box=box.ROUNDED,
             )
+        )
+        arg_summary = ""
+        if args:
+            first_val = next(iter(args.values()), "")
+            arg_summary = f": {str(first_val)[:80]}"
+        send_background_notification(
+            title=f"kanon — Permiso requerido ({risk.value.upper()})",
+            body=f"{tool_name}{arg_summary}",
+            urgency="critical" if risk == RiskLevel.HIGH else "normal",
         )
         try:
             choice = (
@@ -2378,6 +2392,15 @@ async def _run_interactive_session(
                 messages=conversation_history,
                 model_name=client.model_name,
                 project_key=project_key,
+            )
+            first_line = next(
+                (ln.strip() for ln in full_response.splitlines() if ln.strip()),
+                "Respuesta lista.",
+            )
+            send_background_notification(
+                title="kanon — Tarea completada",
+                body=first_line,
+                urgency="normal",
             )
         else:
             # Remove unanswered user turn and notify the user instead of failing silently

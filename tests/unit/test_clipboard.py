@@ -244,13 +244,13 @@ def test_pinned_footer_manager_decstbm_lifecycle() -> None:
 def test_alternate_screen_workspace_enter_and_exit() -> None:
     stream = io.StringIO()
     with AlternateScreenWorkspace(stream=stream, enabled=True):
-        assert stream.getvalue() == "\x1b[?1049h\x1b[2J\x1b[H"
-    assert stream.getvalue().endswith("\x1b[r\x1b[?1049l")
+        assert stream.getvalue() == "\x1b[3J\x1b[2J\x1b[H"
+    assert stream.getvalue().endswith("\x1b[r")
 
-    # Restores alternate screen even if an exception is raised inside
+    # Resets scroll margins even if an exception is raised inside
     stream_err = io.StringIO()
     with pytest.raises(RuntimeError), AlternateScreenWorkspace(stream=stream_err, enabled=True):
         raise RuntimeError("boom")
-    assert stream_err.getvalue().endswith("\x1b[r\x1b[?1049l")
+    assert stream_err.getvalue().endswith("\x1b[r")
 
 
