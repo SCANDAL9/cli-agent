@@ -19,6 +19,7 @@ from cli_agent.main import (
     print_banner,
     prompt_model_switch_dialog,
     pt_style,
+    render_latex_unicode,
     show_models,
 )
 from cli_agent.security import RiskLevel
@@ -189,4 +190,28 @@ async def test_show_models_filters_to_gemini_focus() -> None:
     assert any("4-carbon" in s for s in shorts)
     assert any("4-argon" in s for s in shorts)
     assert len(models) == 6
+
+
+def test_format_bottom_toolbar_spans_full_wide_terminal() -> None:
+    tb = format_bottom_toolbar(terminal_width=160, auto_approve=False, model_name="gemini-4-hydrogen")
+    border_text = tb[0][1]
+    assert border_text == f"{'─' * 160}\n"
+
+
+def test_render_latex_unicode_and_streamer() -> None:
+    assert render_latex_unicode(r"Oscuridad $\rightarrow$ Chainsaw Man") == "Oscuridad → Chainsaw Man"
+    assert render_latex_unicode(r"Complejidad $O(n^2)$ y $\alpha + \beta \leq \infty$") == "Complejidad O(n²) y α + β ≤ ∞"
+    assert render_latex_unicode(r"Fracción $\frac{a}{b}$ y $\sqrt{x}$") == "Fracción a/b y √(x)"
+    # Preserve currency values and inline code spans
+    assert render_latex_unicode("Cuesta $10 y $20 en total") == "Cuesta $10 y $20 en total"
+    assert render_latex_unicode(r"Literal `$\rightarrow$` intacto") == r"Literal `$\rightarrow$` intacto"
+
+    console = Console(record=True, width=100)
+    streamer = RichMarkdownStreamer(console=console, prompt_label="")
+    streamer.on_chunk(r"- Acción $\rightarrow$ **Chainsaw Man**" + "\n\n")
+    streamer.finalize()
+    out = console.export_text()
+    assert "→" in out
+    assert r"\rightarrow" not in out
+
 

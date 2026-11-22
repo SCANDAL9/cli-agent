@@ -5,6 +5,7 @@ prompt_toolkit history/autocompletion, and real-time SSE streaming.
 """
 
 import asyncio
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -167,7 +168,7 @@ def format_bottom_toolbar(
     model_name: str,
 ) -> FormattedText:
     """Formats the REPL bottom toolbar with terminal-adaptive styling (no inverse contrast)."""
-    term_w = max(40, min(terminal_width, 100))
+    term_w = max(20, terminal_width)
     bot_border = f"{'─' * term_w}\n"
     mode_str = "auto" if auto_approve else "default"
     mode_class = (
@@ -541,6 +542,192 @@ def make_security_policy(auto_approve: bool = False) -> SecurityPolicy:
     return policy
 
 
+_LATEX_SYMBOL_MAP: dict[str, str] = {
+    # Arrows
+    "rightarrow": "→",
+    "to": "→",
+    "leftarrow": "←",
+    "gets": "←",
+    "leftrightarrow": "↔",
+    "Rightarrow": "⇒",
+    "implies": "⇒",
+    "Leftarrow": "⇐",
+    "Leftrightarrow": "⇔",
+    "iff": "⇔",
+    "uparrow": "↑",
+    "downarrow": "↓",
+    "updownarrow": "↕",
+    "mapsto": "↦",
+    "longrightarrow": "⟶",
+    "longleftarrow": "⟵",
+    "Longrightarrow": "⟹",
+    "Longleftarrow": "⟸",
+    # Math operators & relations
+    "times": "×",
+    "div": "÷",
+    "pm": "±",
+    "mp": "∓",
+    "cdot": "·",
+    "ast": "∗",
+    "neq": "≠",
+    "ne": "≠",
+    "leq": "≤",
+    "le": "≤",
+    "geq": "≥",
+    "ge": "≥",
+    "approx": "≈",
+    "equiv": "≡",
+    "sim": "∼",
+    "simeq": "≃",
+    "cong": "≅",
+    "propto": "∝",
+    "infty": "∞",
+    "dots": "…",
+    "ldots": "…",
+    "cdots": "⋯",
+    "vdots": "⋮",
+    "ddots": "⋱",
+    "partial": "∂",
+    "nabla": "∇",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "degree": "°",
+    # Logic & sets
+    "in": "∈",
+    "notin": "∉",
+    "subset": "⊂",
+    "subseteq": "⊆",
+    "supset": "⊃",
+    "supseteq": "⊇",
+    "cup": "∪",
+    "cap": "∩",
+    "emptyset": "∅",
+    "varnothing": "∅",
+    "forall": "∀",
+    "exists": "∃",
+    "neg": "¬",
+    "lnot": "¬",
+    "land": "∧",
+    "lor": "∨",
+    "therefore": "∴",
+    "because": "∵",
+    "checkmark": "✓",
+    # Greek letters
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "upsilon": "υ",
+    "phi": "φ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
+
+_SUPERSCRIPT_MAP = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUBSCRIPT_MAP = str.maketrans("0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
+
+_LATEX_CMD_RE = re.compile(r"\\([A-Za-z]+)")
+_INLINE_CODE_SPLIT_RE = re.compile(r"(`[^`]+`)")
+_MATH_BLOCK_RE = re.compile(
+    r"\$\$(.+?)\$\$|\\\((.+?)\\\)|\\\[(.+?)\\\]|\$(?!\s)([^$\n]+?)(?<!\s)\$",
+    re.DOTALL,
+)
+
+
+def _convert_latex_expr(expr: str) -> str:
+    """Converts a LaTeX math expression into clean terminal-friendly Unicode."""
+    out = expr.strip()
+    # Unwrap common text/style wrappers like \text{...}, \mathrm{...}, \mathbf{...}
+    out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname|bf|rm)\{([^{}]*)\}", r"\1", out)
+    # \frac{a}{b} -> a/b or (a)/(b)
+    def _replace_frac(m: re.Match[str]) -> str:
+        num, den = m.group(1).strip(), m.group(2).strip()
+        n_str = num if len(num) <= 2 or num.isalnum() else f"({num})"
+        d_str = den if len(den) <= 2 or den.isalnum() else f"({den})"
+        return f"{n_str}/{d_str}"
+
+    out = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", _replace_frac, out)
+    out = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", out)
+    # Replace known LaTeX symbol commands
+    out = _LATEX_CMD_RE.sub(lambda m: _LATEX_SYMBOL_MAP.get(m.group(1), m.group(0)), out)
+    # Simple superscripts and subscripts
+    out = re.sub(r"\^\{([0-9+\-=()ni]+)\}", lambda m: m.group(1).translate(_SUPERSCRIPT_MAP), out)
+    out = re.sub(r"\^([0-9ni])", lambda m: m.group(1).translate(_SUPERSCRIPT_MAP), out)
+    out = re.sub(
+        r"_\{([0-9+\-=()aehijklmnoprstuvx]+)\}",
+        lambda m: m.group(1).translate(_SUBSCRIPT_MAP),
+        out,
+    )
+    out = re.sub(r"_([0-9ijkmn])", lambda m: m.group(1).translate(_SUBSCRIPT_MAP), out)
+    # Remove LaTeX spacing commands (\, \; \: \!)
+    out = re.sub(r"\\[,;:!]", " ", out)
+    return out
+
+
+def render_latex_unicode(text: str) -> str:
+    """
+    Replaces inline/display LaTeX math notations (such as $\\rightarrow$, $\\leq$, $O(n^2)$)
+    with clean Unicode symbols while preserving inline code spans and currency values.
+    """
+    if "$" not in text and "\\" not in text:
+        return text
+
+    parts = _INLINE_CODE_SPLIT_RE.split(text)
+    rendered_parts: list[str] = []
+
+    for idx, segment in enumerate(parts):
+        # Odd indices are inline `code` spans — leave untouched
+        if idx % 2 == 1:
+            rendered_parts.append(segment)
+            continue
+
+        def _replace_math(m: re.Match[str]) -> str:
+            raw_match = m.group(0)
+            inner = m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""
+            # For single-$ delimiters, avoid eating currency ranges like "$10 and $20"
+            if m.group(4) is not None:
+                has_latex_syntax = (
+                    "\\" in inner
+                    or "^" in inner
+                    or "_" in inner
+                    or any(op in inner for op in ("=", "<", ">", "≈", "≠", "≤", "≥"))
+                )
+                if not has_latex_syntax:
+                    return raw_match
+            return _convert_latex_expr(inner)
+
+        rendered_parts.append(_MATH_BLOCK_RE.sub(_replace_math, segment))
+
+    return "".join(rendered_parts)
+
+
 class RichMarkdownStreamer:
     """
     Streams assistant responses progressively to the terminal with Rich Markdown interpretation,
@@ -621,7 +808,7 @@ class RichMarkdownStreamer:
                 if code_start != -1:
                     before = self._buffer[:code_start].strip()
                     if before:
-                        self.console.print(Markdown(before))
+                        self.console.print(Markdown(render_latex_unicode(before)))
                     self._buffer = self._buffer[code_start:]
                     self._in_code_block = True
                     continue
@@ -632,7 +819,7 @@ class RichMarkdownStreamer:
                     block = self._buffer[:dnl].strip()
                     self._buffer = self._buffer[dnl + 2 :]
                     if block:
-                        self.console.print(Markdown(block))
+                        self.console.print(Markdown(render_latex_unicode(block)))
                     continue
 
                 # Header line or divider ending with newline
@@ -640,7 +827,7 @@ class RichMarkdownStreamer:
                 if nl != -1:
                     line = self._buffer[:nl].strip()
                     if line.startswith("#") or line in ("---", "***", "___"):
-                        self.console.print(Markdown(line))
+                        self.console.print(Markdown(render_latex_unicode(line)))
                         self._buffer = self._buffer[nl + 1 :]
                         continue
 
@@ -648,7 +835,7 @@ class RichMarkdownStreamer:
                 if finalize:
                     rem = self._buffer.strip()
                     if rem:
-                        self.console.print(Markdown(rem))
+                        self.console.print(Markdown(render_latex_unicode(rem)))
                     self._buffer = ""
                 break
             else:
@@ -803,7 +990,7 @@ async def run_interactive(
         if max_turns is not None and turns_completed >= max_turns:
             break
         try:
-            w = max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+            w = max(20, shutil.get_terminal_size((80, 24)).columns)
 
             def get_bottom_toolbar() -> AnyFormattedText:
                 term_w = shutil.get_terminal_size((80, 24)).columns
@@ -822,7 +1009,7 @@ async def run_interactive(
                 )
             ).strip()
             if user_input:
-                term_w = max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+                term_w = max(20, shutil.get_terminal_size((80, 24)).columns)
                 console.print(f"[dim]{'─' * term_w}[/dim]")
         except (KeyboardInterrupt, EOFError):
             if conversation_history:
