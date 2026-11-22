@@ -126,7 +126,7 @@ class VertexAgentClient:
             for m in recent_mems:
                 memory_context += f"- [{m['type'].upper()}] {m['title']}: {m['content']}\n"
 
-        return f"""You are 'cli-agent', an elite Senior Software Architect and Autonomous Developer Assistant running directly on the user's Linux workstation.
+        return f"""You are 'kanon', an elite Senior Software Architect and Autonomous Developer Assistant running directly on the user's Linux workstation.
 You have access to powerful local system tools and persistent SQLite memory.
 
 Your Core Capabilities:

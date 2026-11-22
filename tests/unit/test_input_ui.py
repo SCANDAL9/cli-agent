@@ -103,7 +103,7 @@ def test_print_banner_renders_rich_panel() -> None:
             turn_count=3,
         )
     output = console.export_text()
-    assert "cli-agent" in output
+    assert "kanon" in output
     assert "gemini-3.8-flash" in output
     assert "my-workspace" in output
     assert "sess-test-123" in output

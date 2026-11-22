@@ -545,7 +545,7 @@ def print_banner(
     c_border = p.border if p.is_matugen else "dim cyan"
     theme_badge = f" [dim]•[/dim] [{c_secondary}]Matugen[/{c_secondary}]" if p.is_matugen else ""
     banner_text = (
-        f"[bold {c_primary}]cli-agent[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
+        f"[bold {c_primary}]kanon[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
         f"[{c_secondary}]SQLite Memory ({memory_count} memories)[/{c_secondary}] [dim]•[/dim] [{c_primary}]AST Code Graph[/{c_primary}]{theme_badge}\n"
         f"[dim]Workspace:[/dim] [bold white]~/{ws_name}[/bold white] [dim]•[/dim] [dim]{session_badge}[/dim]\n"
         f"[dim]Shortcuts:[/dim] [bold {c_primary}]![/bold {c_primary}] [dim]shell[/dim]   "
@@ -556,7 +556,7 @@ def print_banner(
     console.print(
         Panel(
             banner_text,
-            title=f"[bold {c_primary}]❖ AI Developer Assistant[/bold {c_primary}]",
+            title=f"[bold {c_primary}]❖ kanon — AI Developer Assistant[/bold {c_primary}]",
             border_style=c_border,
             box=box.ROUNDED,
         )
@@ -1224,7 +1224,7 @@ class RichMarkdownStreamer:
     """
 
     def __init__(
-        self, console: Console, prompt_label: str = "\n[bold magenta]agent ❯[/bold magenta]\n"
+        self, console: Console, prompt_label: str = "\n[bold magenta]kanon ❯[/bold magenta]\n"
     ) -> None:
         self.console = console
         self.prompt_label = prompt_label
@@ -2392,9 +2392,9 @@ async def _run_interactive_session(
 def print_help() -> None:
     console.print(
         Panel.fit(
-            "[bold cyan]cli-agent[/bold cyan] - Autonomous AI Developer Assistant\n\n"
+            "[bold cyan]kanon[/bold cyan] - Autonomous AI Developer Assistant\n\n"
             "[bold]Usage:[/bold]\n"
-            "  cli-agent [options] [prompt]\n\n"
+            "  kanon [options] [prompt]\n\n"
             "[bold]Session Options:[/bold]\n"
             "  [bold cyan]-c, --continue[/bold cyan]              Resume the most recent session in this workspace\n"
             "  [bold cyan]--resume [SESSION_ID][/bold cyan]       Resume a specific session (or latest if omitted)\n"
@@ -2409,7 +2409,7 @@ def print_help() -> None:
             "  [bold cyan]-h, --help[/bold cyan]                  Show this help overview and exit\n\n"
             "[bold]REPL Slash Commands:[/bold]\n"
             "  /sessions, /resume [id], /session, /memories, /model, /pr, /doctor, /exit",
-            title="[bold magenta]cli-agent CLI Help[/bold magenta]",
+            title="[bold magenta]kanon CLI Help[/bold magenta]",
             border_style="cyan",
             box=box.ROUNDED,
         )
