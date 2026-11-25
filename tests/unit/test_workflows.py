@@ -586,6 +586,30 @@ def test_workflow_checkpoint_rejects_escaping_symlink_and_cleans_partial_git_sta
 
 
 @pytest.mark.unit
+def test_workflow_checkpoint_preserves_safe_untracked_symlinks(tmp_path: Path):
+    _init_repo(tmp_path)
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    source_link = inputs / "tracked-target.txt"
+    source_link.symlink_to("../tracked.txt")
+
+    checkpoint = WorkflowCheckpointManager(tmp_path).create(run_id="safe-symlink")
+
+    try:
+        copied_link = checkpoint.worktree_path / "inputs" / "tracked-target.txt"
+        assert copied_link.is_symlink()
+        assert copied_link.readlink() == Path("../tracked.txt")
+        assert copied_link.read_text(encoding="utf-8") == "committed\n"
+        assert source_link.is_symlink()
+        assert source_link.readlink() == Path("../tracked.txt")
+        assert (tmp_path / "tracked.txt").read_text(encoding="utf-8") == "committed\n"
+    finally:
+        checkpoint.discard()
+
+    assert not checkpoint.worktree_path.exists()
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_workflow_gate_failure_discards_only_isolated_checkpoint(tmp_path: Path):
     _init_repo(tmp_path)

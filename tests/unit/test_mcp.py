@@ -219,6 +219,46 @@ class TestMCPRegistryAndToolDispatch:
         err_res = await registry.execute_tool("mcp__unknown__tool", {})
         assert "is not registered" in err_res["error"]
 
+    async def test_connect_all_and_shutdown_keep_only_connected_servers(self) -> None:
+        from cli_agent.mcp import MCPRegistry
+
+        registry = MCPRegistry()
+        successful_tool = MCPTool(
+            server_name="available",
+            name="status",
+            full_name="mcp__available__status",
+            description="Read server status",
+            input_schema={},
+        )
+        available_client = AsyncMock()
+        available_client.connect = AsyncMock()
+        available_client.list_tools = AsyncMock(return_value=[successful_tool])
+        available_client.disconnect = AsyncMock()
+        unavailable_client = AsyncMock()
+        unavailable_client.connect = AsyncMock(side_effect=RuntimeError("server unavailable"))
+
+        configs = [
+            MCPServerConfig(name="available", command="server-a"),
+            MCPServerConfig(name="unavailable", command="server-b"),
+        ]
+        with (
+            patch.object(registry, "load_configs", return_value=configs),
+            patch(
+                "cli_agent.mcp.MCPServerClient",
+                side_effect=[available_client, unavailable_client],
+            ),
+        ):
+            assert await registry.connect_all() == 1
+
+        assert registry.servers == {"available": available_client}
+        assert registry.tools == {successful_tool.full_name: successful_tool}
+
+        await registry.shutdown_all()
+
+        available_client.disconnect.assert_awaited_once_with()
+        assert registry.servers == {}
+        assert registry.tools == {}
+
     async def test_tools_py_routing_mcp(self) -> None:
         from cli_agent.mcp import MCPRegistry
 

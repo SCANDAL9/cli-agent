@@ -92,6 +92,25 @@ class TestGitWorktreeLifecycle:
         assert (session.worktree_dir / "uncommitted.txt").exists()
         session.cleanup()
 
+    def test_create_worker_session_on_orphan_repo(
+        self, empty_git_repo: Path, tmp_path: Path
+    ) -> None:
+        (empty_git_repo / "uncommitted.txt").write_text("draft code", encoding="utf-8")
+        manager = WorktreeManager(base_dir=tmp_path / "worker_worktrees_orphan")
+
+        session = manager.create_worker_session(
+            plan_id="plan-1", node_id="worker-1", repo_path=empty_git_repo
+        )
+        try:
+            copied_file = session.worktree_dir / "uncommitted.txt"
+            assert session.is_active is True
+            assert copied_file.read_text(encoding="utf-8") == "draft code"
+            assert session.branch_name == "swarm/plan-1/worker-1"
+        finally:
+            manager.cleanup_all()
+
+        assert not session.worktree_dir.exists()
+
     def test_create_session_fails_on_non_git_dir(self, tmp_path: Path) -> None:
         non_repo = tmp_path / "plain_dir"
         non_repo.mkdir()

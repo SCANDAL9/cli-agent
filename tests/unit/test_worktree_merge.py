@@ -256,6 +256,115 @@ class TestASTThreeWayMerger:
         finally:
             wm.cleanup_all()
 
+    def test_stage2_disjoint_class_methods_and_assignments_merge(
+        self, temp_git_repo: Path, tmp_path: Path
+    ) -> None:
+        base_source = (
+            "class Calculator:\n"
+            "    def left(self) -> int:\n"
+            "        return 1\n\n"
+            "    def right(self) -> int:\n"
+            "        return 2\n\n"
+            "LEFT_VALUE = 10\n"
+            "RIGHT_VALUE = 20\n"
+        )
+        (temp_git_repo / "shared.py").write_text(base_source, encoding="utf-8")
+        subprocess.run(["git", "add", "shared.py"], cwd=temp_git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add class and module assignments"],
+            cwd=temp_git_repo,
+            check=True,
+            capture_output=True,
+        )
+        wm = WorktreeManager(base_dir=tmp_path / "wt_class_ast")
+        try:
+            base_s = wm.create_worker_session("class", "base", repo_path=temp_git_repo)
+            w1 = wm.create_worker_session("class", "w1", repo_path=temp_git_repo)
+            w2 = wm.create_worker_session("class", "w2", repo_path=temp_git_repo)
+            int_s = wm.create_worker_session("class", "integration", repo_path=temp_git_repo)
+
+            w1_source = base_source.replace("return 1", "return 11").replace(
+                "LEFT_VALUE = 10", "LEFT_VALUE = 110"
+            )
+            w2_source = base_source.replace("return 2", "return 22").replace(
+                "RIGHT_VALUE = 20", "RIGHT_VALUE = 220"
+            )
+            (w1.worktree_dir / "shared.py").write_text(w1_source, encoding="utf-8")
+            (w2.worktree_dir / "shared.py").write_text(w2_source, encoding="utf-8")
+
+            result = ASTThreeWayMerger(temp_git_repo).merge_worker_sessions(
+                base_session=base_s,
+                worker_sessions={"w1": w1, "w2": w2},
+                integration_session=int_s,
+            )
+
+            assert result.status in {"clean", "ast_resolved"}
+            assert not result.conflicts
+            merged_source = (int_s.worktree_dir / "shared.py").read_text(encoding="utf-8")
+            ast.parse(merged_source)
+            assert "return 11" in merged_source
+            assert "return 22" in merged_source
+            assert "LEFT_VALUE = 110" in merged_source
+            assert "RIGHT_VALUE = 220" in merged_source
+        finally:
+            wm.cleanup_all()
+
+    def test_stage2_ast_splice_preserves_disjoint_deletion_and_append(
+        self, temp_git_repo: Path, tmp_path: Path
+    ) -> None:
+        base_source = (
+            "def keep_value() -> int:\n    return 1\n\n\ndef remove_value() -> int:\n    return 2\n"
+        )
+        (temp_git_repo / "shared.py").write_text(base_source, encoding="utf-8")
+        subprocess.run(["git", "add", "shared.py"], cwd=temp_git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Add merge deletion fixture"],
+            cwd=temp_git_repo,
+            check=True,
+            capture_output=True,
+        )
+        wm = WorktreeManager(base_dir=tmp_path / "wt_ast_delete")
+        try:
+            base_s = wm.create_worker_session("delete", "base", repo_path=temp_git_repo)
+            w1 = wm.create_worker_session("delete", "w1", repo_path=temp_git_repo)
+            w2 = wm.create_worker_session("delete", "w2", repo_path=temp_git_repo)
+            int_s = wm.create_worker_session("delete", "integration", repo_path=temp_git_repo)
+
+            current_source = (
+                "def keep_value() -> int:\n"
+                "    return 10\n\n\n"
+                "def remove_value() -> int:\n"
+                "    return 2\n\n\n"
+                "def helper_one() -> str:\n"
+                "    return 'one'\n"
+            )
+            other_source = (
+                "def keep_value() -> int:\n"
+                "    return 1\n\n\n"
+                "def helper_two() -> str:\n"
+                "    return 'two'\n"
+            )
+            (w1.worktree_dir / "shared.py").write_text(current_source, encoding="utf-8")
+            (w2.worktree_dir / "shared.py").write_text(other_source, encoding="utf-8")
+
+            result = ASTThreeWayMerger(temp_git_repo).merge_worker_sessions(
+                base_session=base_s,
+                worker_sessions={"w1": w1, "w2": w2},
+                integration_session=int_s,
+            )
+
+            assert result.status == "ast_resolved"
+            assert "shared.py" in result.ast_resolved_files
+            assert not result.conflicts
+            merged_source = (int_s.worktree_dir / "shared.py").read_text(encoding="utf-8")
+            ast.parse(merged_source)
+            assert "return 10" in merged_source
+            assert "def remove_value" not in merged_source
+            assert "def helper_one" in merged_source
+            assert "def helper_two" in merged_source
+        finally:
+            wm.cleanup_all()
+
     def test_stage2_overlapping_ast_symbol_mutation_flags_conflict(
         self, temp_git_repo: Path, tmp_path: Path
     ) -> None:

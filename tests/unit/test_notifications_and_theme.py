@@ -73,6 +73,21 @@ def test_kitty_osc99_notification_format_and_dispatch(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.unit
+def test_kitty_osc99_notification_sanitizes_and_bounds_payloads() -> None:
+    title = " \tTask\x1b[31m " + "T" * 110 + "\n\x07"
+    body = " \tDetails\n" + "B" * 200 + "\x1b\x07"
+
+    sequence = build_kitty_osc99_notification(title=title, body=body)
+
+    expected_title = ("Task[31m " + "T" * 110)[:99] + "…"
+    expected_body = ("Details " + "B" * 200)[:179] + "…"
+    assert f"p=title;{expected_title}\x1b\\" in sequence
+    assert f"p=body;{expected_body}\x1b\\" in sequence
+    assert "\x1b[31m" not in sequence
+    assert "\x07" not in sequence
+
+
+@pytest.mark.unit
 def test_background_notification_fallback_to_notify_send(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KITTY_WINDOW_ID", raising=False)
     monkeypatch.setenv("TERM", "xterm-256color")
