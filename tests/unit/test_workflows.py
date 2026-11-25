@@ -23,7 +23,11 @@ from cli_agent.workflows import (
 )
 from cli_agent.workflows.checkpoint import WorkflowCheckpointManager
 from cli_agent.workflows.commands import format_verify_gate, format_workflow_inputs
-from cli_agent.workflows.runner import WorkflowExecutionError, execute_shell_command
+from cli_agent.workflows.runner import (
+    WorkflowAborted,
+    WorkflowExecutionError,
+    execute_shell_command,
+)
 
 
 def _init_repo(path: Path) -> None:
@@ -449,6 +453,41 @@ async def test_execute_shell_command_timeout_terminates_the_process(tmp_path: Pa
             execute_shell_command("sleep 30", tmp_path, 0.1, asyncio.Event()),
             timeout=2,
         )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_shell_command_bounds_output_and_redacts_secrets(tmp_path: Path):
+    command = (
+        'python3 -c \'import sys; sys.stdout.write("x" * 1_100_000); '
+        'sys.stderr.write("password=example-secret-value")\''
+    )
+
+    result = await execute_shell_command(command, tmp_path, 5, asyncio.Event())
+
+    assert result["exit_code"] == 0
+    assert result["stdout_truncated"] is True
+    assert len(result["stdout"]) < 1_100_000
+    assert result["stderr"] == "password=[REDACTED_SECRET]"
+    assert "example-secret-value" not in result["stderr"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_shell_command_stops_when_abort_event_is_set(tmp_path: Path):
+    abort_event = asyncio.Event()
+
+    async def request_abort() -> None:
+        await asyncio.sleep(0.05)
+        abort_event.set()
+
+    abort_task = asyncio.create_task(request_abort())
+    command = subprocess.list2cmdline([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    with pytest.raises(WorkflowAborted, match="Workflow aborted by the user"):
+        await asyncio.wait_for(execute_shell_command(command, tmp_path, 5, abort_event), timeout=3)
+
+    await abort_task
 
 
 @pytest.mark.unit
