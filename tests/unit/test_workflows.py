@@ -291,6 +291,94 @@ async def test_workflow_runner_self_heal_retries_and_persists_the_successful_att
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_workflow_verify_gate_persists_expected_stdout_and_stderr(tmp_path: Path):
+    _init_repo(tmp_path)
+    workflow_path = _workflow_file(tmp_path)
+    workflow_path.write_text(
+        workflow_path.read_text(encoding="utf-8").replace(
+            "expected_exit_code = 0\n",
+            'expected_exit_code = 0\nexpected_output = "verified"\nexpected_stderr = "warning"\n',
+        ),
+        encoding="utf-8",
+    )
+
+    async def command_executor(*_args: Any) -> dict[str, Any]:
+        return {"exit_code": 0, "stdout": "verified output", "stderr": "warning: slow"}
+
+    engine = _make_engine(
+        tmp_path,
+        command_executor=command_executor,
+        agent_executor=lambda *_args: asyncio.sleep(0, result="implemented"),
+    )
+    run_id = engine.start("demo", {"feature": "gate"})
+
+    result = await engine.wait(run_id)
+    run = engine.history.get_run(run_id)
+    verify_step = next(step for step in run["steps"] if step["step_id"] == "verify")
+    gate_result = verify_step["output"]["verify_gate"]
+
+    assert result.status == "completed", result.error
+    assert gate_result["stdout"] == "verified output"
+    assert gate_result["stderr"] == "warning: slow"
+    _remove_retained_worktree(result.worktree_path, result.branch_name, tmp_path)
+    await engine.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_workflow_retry_exhaustion_persists_failure_and_events(tmp_path: Path):
+    _init_repo(tmp_path)
+    directory = tmp_path / ".cli-agent" / "workflows"
+    directory.mkdir(parents=True)
+    (directory / "retry.toml").write_text(
+        'id = "retry"\nname = "Retry workflow"\ndescription = "Retry exhaustion test"\n'
+        'version = "1.0.0"\n\n[[steps]]\nid = "check"\nname = "Check"\n'
+        'action = "shell"\ncommand = "printf check"\n\n[steps.on_failure]\n'
+        'action = "self_heal"\nprompt = "Repair after: {{ error }}"\nmax_retries = 1\n',
+        encoding="utf-8",
+    )
+    attempts: list[str] = []
+    repairs: list[str] = []
+    events: list[dict[str, Any]] = []
+
+    async def command_executor(command: str, *_args: Any) -> dict[str, Any]:
+        attempts.append(command)
+        return {"exit_code": 1, "stdout": "", "stderr": "persistent failure"}
+
+    async def agent_executor(prompt: str, _cwd: Path) -> str:
+        repairs.append(prompt)
+        return "repair attempted"
+
+    engine = _make_engine(
+        tmp_path,
+        command_executor=command_executor,
+        agent_executor=agent_executor,
+    )
+    engine.add_event_listener(events.append)
+    run_id = engine.start("retry", {})
+
+    result = await engine.wait(run_id)
+    run = engine.history.get_run(run_id)
+    step = run["steps"][0]
+
+    assert result.status == "failed"
+    assert "persistent failure" in result.error
+    assert attempts == ["printf check", "printf check"]
+    assert len(repairs) == 1
+    assert step["status"] == "failed"
+    assert step["attempt"] == 2
+    assert "persistent failure" in step["error"]
+    assert [(event["status"], event["attempt"]) for event in events if event.get("step_id")] == [
+        ("running", 1),
+        ("retrying", 1),
+        ("running", 2),
+        ("failed", 2),
+    ]
+    await engine.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_workflow_engine_validates_and_normalizes_typed_inputs(tmp_path: Path):
     _init_repo(tmp_path)
     directory = tmp_path / ".cli-agent" / "workflows"
@@ -502,6 +590,59 @@ async def test_workflow_gate_failure_discards_only_isolated_checkpoint(tmp_path:
 
 
 @pytest.mark.unit
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_workflow_failure_retains_checkpoint_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _init_repo(tmp_path)
+    directory = tmp_path / ".cli-agent" / "workflows"
+    directory.mkdir(parents=True)
+    (directory / "failure.toml").write_text(
+        'id = "failure"\nname = "Failure workflow"\ndescription = "Cleanup failure test"\n'
+        'version = "1.0.0"\n\n[[steps]]\nid = "check"\nname = "Check"\n'
+        'action = "shell"\ncommand = "printf check"\n',
+        encoding="utf-8",
+    )
+    checkpoint_manager = WorkflowCheckpointManager(tmp_path)
+    created_checkpoints = []
+    create_checkpoint = checkpoint_manager.create
+
+    def capture_checkpoint(**kwargs: Any):
+        checkpoint = create_checkpoint(**kwargs)
+        created_checkpoints.append(checkpoint)
+        return checkpoint
+
+    monkeypatch.setattr(checkpoint_manager, "create", capture_checkpoint)
+    engine = _make_engine(
+        tmp_path,
+        command_executor=lambda *_args: asyncio.sleep(
+            0, result={"exit_code": 1, "stdout": "", "stderr": "verification failed"}
+        ),
+    )
+    engine.checkpoint_manager = checkpoint_manager
+    monkeypatch.setattr(engine, "_discard_checkpoint", lambda _checkpoint: "cleanup denied")
+    run_id = engine.start("failure", {})
+
+    try:
+        result = await engine.wait(run_id)
+        run = engine.history.get_run(run_id)
+
+        assert result.status == "failed"
+        assert "Checkpoint cleanup failed: cleanup denied" in result.error
+        assert result.worktree_path is not None
+        assert result.branch_name is not None
+        assert result.tag_name is not None
+        assert Path(result.worktree_path).is_dir()
+        assert run["worktree_path"] == result.worktree_path
+        assert run["branch_name"] == result.branch_name
+        assert run["tag_name"] == result.tag_name
+    finally:
+        for checkpoint in created_checkpoints:
+            checkpoint.discard()
+        await engine.aclose()
+
+
 @pytest.mark.asyncio
 async def test_workflow_abort_cancels_running_command_and_removes_its_branch(tmp_path: Path):
     _init_repo(tmp_path)
