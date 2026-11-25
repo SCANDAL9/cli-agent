@@ -239,6 +239,36 @@ The agent interacts with your workstation via atomic tools:
 - **`save_memory`**: Persist decisions, discoveries, conventions, or bug fixes across sessions.
 - **`search_memory`**: Query persistent memories using full-text search.
 
+### Declarative Workflows
+
+Workflows can be defined as TOML or YAML files in `.cli-agent/workflows/`; user-level
+recipes live in `~/.config/cli-agent/workflows/`. Workspace definitions override
+user recipes, which override the four bundled recipes. Use:
+
+```text
+/workflow list
+/workflow describe strict-tdd
+/workflow run strict-tdd feature_description="Add retry handling" target_module=src/cli_agent/client.py test_name=test_retry_limit
+/workflow abort
+```
+
+`/workflow list` shows each recipe's description and inputs. `/workflow describe <id>`
+shows step dependencies and verification gates. Bundled recipes cover strict TDD
+(including a Python AST parse gate), code health (secret scan, formatting/linting,
+type checking, and bounded LSP diagnostics), security review, and dependency auditing
+(outdated/unused packages plus known vulnerability advisories). The dependency audit
+uses [`uvx` and `uv run --with`](https://docs.astral.sh/uv/guides/tools/) to obtain its
+audit tools, including [pip-audit](https://github.com/pypa/pip-audit), and may contact
+configured package and advisory services; the normal workflow permission prompt must
+approve each command.
+
+Each run starts from an isolated Git worktree that includes tracked edits and
+visible untracked files from the current workspace. Successful runs leave their
+branch, checkpoint tag, and worktree for inspection; failures and aborts remove
+only that run's checkpoint, leaving the original workspace untouched. Shell and verification
+commands pass through the existing permission policy. Runs and step outcomes are
+recorded in the configured storage backend.
+
 ---
 
 ## Configuration

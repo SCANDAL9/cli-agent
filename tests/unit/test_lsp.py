@@ -243,6 +243,47 @@ class TestToolEnrichmentIntegration:
 
 @pytest.mark.unit
 class TestHeadlessLSPClientEdgeCases:
+    def test_client_discards_diagnostics_for_older_document_version(self, tmp_path: Path) -> None:
+        client = HeadlessLSPClient(
+            server_name="test",
+            command=["echo"],
+            workspace_root=tmp_path,
+        )
+        uri = (tmp_path / "sample.py").as_uri()
+        client._opened_docs[uri] = 2
+
+        client._dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "version": 1,
+                    "diagnostics": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "severity": 1,
+                            "message": "stale syntax error",
+                            "code": "SyntaxError",
+                        }
+                    ],
+                },
+            }
+        )
+
+        assert uri not in client._diagnostics_cache
+        client._dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {"uri": uri, "version": 2, "diagnostics": []},
+            }
+        )
+        assert client._diagnostics_cache[uri] == []
+
     @pytest.mark.asyncio
     async def test_find_executable_nonexistent_returns_none(self) -> None:
         assert _find_executable("completely_nonexistent_binary_xyz_123") is None

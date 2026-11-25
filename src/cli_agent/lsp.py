@@ -301,6 +301,15 @@ class HeadlessLSPClient:
         if method == "textDocument/publishDiagnostics":
             params = msg.get("params", {})
             uri = params.get("uri", "")
+            version = params.get("version")
+            current_version = self._opened_docs.get(uri)
+            if (
+                isinstance(version, int)
+                and not isinstance(version, bool)
+                and current_version is not None
+                and version < current_version
+            ):
+                return
             raw_diags = params.get("diagnostics", [])
             normalized = self._normalize_diagnostics(uri, raw_diags)
             self._diagnostics_cache[uri] = normalized
@@ -349,6 +358,8 @@ class HeadlessLSPClient:
         if not self.is_ready:
             return
 
+        # Invalidate any cached diagnostics from previous versions of this file
+        self._diagnostics_cache.pop(uri, None)
         if uri not in self._diagnostic_events:
             self._diagnostic_events[uri] = asyncio.Event()
         self._diagnostic_events[uri].clear()

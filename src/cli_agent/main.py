@@ -51,6 +51,7 @@ from .config import (
 )
 from .context import compact_history, extract_session_learnings
 from .doctor import run_diagnostics
+from .events import get_event_bus
 from .mcp import MCPRegistry, set_active_mcp_registry
 from .memory import MemoryStore, resolve_project_key
 from .models import ModelCatalogEntry, fetch_model_garden_catalog
@@ -69,10 +70,19 @@ from .theme import (
     hex_to_ansi_fg,
     load_matugen_palette,
 )
-from .tools import set_active_sandbox
+from .tools import _redact_secrets, set_active_sandbox
 from .tui import TUIApp, TUILayoutManager
 from .vertex import VertexAgentClient
 from .voice import VoiceAgentEngine
+from .workflows import (
+    WorkflowEngine,
+    WorkflowHistoryStore,
+    WorkflowLoader,
+    WorkflowPermissionBroker,
+    WorkflowPermissionRequest,
+    handle_workflow_command,
+)
+from .workflows.commands import format_verify_gate, format_workflow_inputs
 from .worktree import DiffViewer, WorktreeManager, WorktreeSession
 
 matugen_palette: MatugenPalette = load_matugen_palette()
@@ -94,6 +104,7 @@ SLASH_COMMANDS = [
     "/search",
     "/sandbox",
     "/team",
+    "/workflow",
     "/mcp",
     "/tdd",
     "/fix",
@@ -122,6 +133,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/search": "Hybrid BM25 + dense vector code search",
     "/sandbox": "Manage isolated Git worktree sandbox",
     "/team": "Run autonomous multi-agent swarm (ODD)",
+    "/workflow": "List, inspect, run, or abort declarative workflows",
     "/mcp": "Inspect and reload federated MCP servers",
     "/tdd": "Autonomous Red-Green-Refactor healing loop",
     "/fix": "Alias for /tdd autonomous repair",
@@ -1544,6 +1556,64 @@ async def _run_interactive_session(
     team_coordinator = MultiAgentTeam(client=client)
     set_active_team(team_coordinator)
 
+    async def execute_workflow_prompt(prompt: str, worktree: Path) -> str:
+        instruction = (
+            f"{client.system_instruction}\n\n"
+            "You are executing one step in a declarative workflow. "
+            f"The isolated workflow workspace is {worktree}. Keep all file changes inside it. "
+            "Use relative paths and report the concrete result of this step."
+        )
+        return await client.chat(
+            [{"role": "user", "parts": [{"text": prompt}]}],
+            system_instruction=instruction,
+        )
+
+    def show_workflow_permission(request: WorkflowPermissionRequest) -> None:
+        arguments = _redact_secrets(repr(request.arguments))[:800]
+
+        def render_request() -> None:
+            details = f"Tool: {request.tool_name}\nRisk: {request.risk.value}"
+            if arguments:
+                details += f"\nArguments: {arguments}"
+            console.print(
+                Panel(
+                    details,
+                    title=f"Workflow approval required · {request.request_id}",
+                    border_style="yellow",
+                )
+            )
+            console.print("[bold white]Approve this workflow action? [y/n][/bold white]")
+
+        asyncio.ensure_future(run_in_terminal(render_request))
+
+    workflow_permission_broker = WorkflowPermissionBroker(on_request=show_workflow_permission)
+    workflow_engine = WorkflowEngine(
+        loader=WorkflowLoader(workspace_root=Path.cwd()),
+        history=WorkflowHistoryStore(memory_store.storage_engine),
+        security_policy=security_policy,
+        event_bus=get_event_bus(),
+        agent_executor=execute_workflow_prompt,
+        permission_callback=workflow_permission_broker.request,
+    )
+
+    def on_workflow_event(event: dict[str, Any]) -> None:
+        step_id = event.get("step_id")
+        status = event.get("status")
+        if not (step_id and status) and status not in {"completed", "failed", "aborted"}:
+            return
+
+        def render_event() -> None:
+            if step_id and status:
+                console.print(f"[dim cyan]Workflow {step_id}: {status}[/dim cyan]")
+            else:
+                console.print(
+                    f"[bold cyan]Workflow run {event.get('run_id', '')}: {status}[/bold cyan]"
+                )
+
+        asyncio.ensure_future(run_in_terminal(render_event))
+
+    workflow_engine.add_event_listener(on_workflow_event)
+
     mcp_registry = MCPRegistry()
     set_active_mcp_registry(mcp_registry)
     try:
@@ -1607,6 +1677,7 @@ async def _run_interactive_session(
     turns_completed = 0
     while True:
         if max_turns is not None and turns_completed >= max_turns:
+            await workflow_engine.aclose()
             break
         try:
             w = max(20, shutil.get_terminal_size((80, 24)).columns)
@@ -1633,6 +1704,7 @@ async def _run_interactive_session(
                 term_w = max(20, shutil.get_terminal_size((80, 24)).columns)
                 console.print(f"[dim]{'─' * term_w}[/dim]")
         except (KeyboardInterrupt, EOFError):
+            await workflow_engine.aclose()
             if conversation_history:
                 session_store.save_session(
                     session_id=active_session_id,
@@ -1645,6 +1717,43 @@ async def _run_interactive_session(
         turns_completed += 1
 
         if not user_input:
+            continue
+
+        if workflow_permission_broker.pending is not None:
+            answer = user_input.strip().lower()
+            if answer in {"y", "yes", "n", "no"}:
+                workflow_permission_broker.resolve(answer in {"y", "yes"})
+                console.print(
+                    "[dim]Workflow action approved.[/dim]"
+                    if answer in {"y", "yes"}
+                    else "[dim]Workflow action denied.[/dim]"
+                )
+                continue
+            if not user_input.startswith("/workflow") and user_input not in {
+                "/exit",
+                "/quit",
+                "exit",
+                "quit",
+            }:
+                console.print(
+                    "[dim yellow]Answer the workflow approval with y or n, or abort it with /workflow abort.[/dim yellow]"
+                )
+                continue
+
+        if (
+            workflow_engine.is_running
+            and not user_input.startswith("/workflow")
+            and user_input
+            not in {
+                "/exit",
+                "/quit",
+                "exit",
+                "quit",
+            }
+        ):
+            console.print(
+                "[dim yellow]A workflow is active. Use /workflow abort or wait for it to finish.[/dim yellow]"
+            )
             continue
 
         if user_input.startswith("!"):
@@ -1677,6 +1786,7 @@ async def _run_interactive_session(
 
         if user_input in ("/exit", "/quit", "exit", "quit"):
             console.print("[bold green]Hasta luego![/bold green]")
+            await workflow_engine.aclose()
             if active_sandbox:
                 active_sandbox.cleanup()
                 set_active_sandbox(None)
@@ -2026,6 +2136,58 @@ async def _run_interactive_session(
                 else:
                     console.print(
                         "[dim]Sandbox is currently [bold]inactive[/bold]. Type [bold]/sandbox on[/bold] to isolate changes in an ephemeral worktree.[/dim]"
+                    )
+            continue
+
+        if user_input == "/workflow" or user_input.startswith("/workflow "):
+            try:
+                result = await handle_workflow_command(workflow_engine, user_input)
+            except Exception as exc:
+                console.print(f"[bold red]Workflow command failed:[/bold red] {exc}")
+                continue
+            if result.action == "list":
+                table = Table(
+                    title="Available workflows", show_header=True, header_style="bold cyan"
+                )
+                table.add_column("ID", style="bold white")
+                table.add_column("Name", style="green")
+                table.add_column("Description")
+                table.add_column("Inputs")
+                for definition in result.payload:
+                    table.add_row(
+                        definition.id,
+                        definition.name,
+                        definition.description,
+                        format_workflow_inputs(definition),
+                    )
+                console.print(table)
+            elif result.action == "describe":
+                definition = result.payload
+                table = Table(
+                    title=f"Workflow: {definition.name}",
+                    show_header=True,
+                    header_style="bold cyan",
+                )
+                table.add_column("Step", style="bold white")
+                table.add_column("Action", style="green")
+                table.add_column("Dependencies", style="dim")
+                table.add_column("Verify gate")
+                for step in definition.steps:
+                    table.add_row(
+                        step.id,
+                        step.action,
+                        ", ".join(step.depends_on) or "—",
+                        format_verify_gate(step),
+                    )
+                console.print(
+                    Panel(definition.description, title=definition.id, border_style="cyan")
+                )
+                console.print(table)
+            else:
+                console.print(result.message)
+                if result.action == "abort" and result.payload is not None:
+                    console.print(
+                        "[dim]Original workspace was not modified; the isolated checkpoint was removed.[/dim]"
                     )
             continue
 
@@ -2411,6 +2573,7 @@ async def _run_interactive_session(
                 " - [bold]/search <query>[/bold]: Hybrid BM25 + vector search with Reciprocal Rank Fusion\n"
                 " - [bold]/sandbox [on|diff|apply|discard][/bold]: Manage isolated Git worktree sandboxing\n"
                 " - [bold]/team <goal>[/bold]: Run autonomous multi-agent swarm (Architect -> Worker -> QA)\n"
+                " - [bold]/workflow [list|describe|run|abort][/bold]: Run a validated declarative workflow in an isolated Git worktree\n"
                 " - [bold]/mcp [list|reload][/bold]: Inspect and reload federated MCP servers and tools\n"
                 " - [bold]/tdd <target>[/bold]: Run autonomous TDD self-healing loop on a failing test\n"
                 " - [bold]/pr [preview|create|watch][/bold]: Synthesize, create, or watch GitHub/GitLab PR/MRs\n"
@@ -2564,7 +2727,8 @@ def print_help() -> None:
             "  [bold cyan]--voice[/bold cyan]                     Launch bidirectional Gemini Live voice session\n"
             "  [bold cyan]-h, --help[/bold cyan]                  Show this help overview and exit\n\n"
             "[bold]REPL Slash Commands:[/bold]\n"
-            "  /sessions, /resume [id], /session, /memories, /model, /pr, /doctor, /exit",
+            "  /sessions, /resume [id], /session, /memories, /model, /workflow [list|describe|run|abort],\n"
+            "  /pr, /doctor, /exit",
             title="[bold magenta]kanon CLI Help[/bold magenta]",
             border_style="cyan",
             box=box.ROUNDED,
