@@ -8,6 +8,7 @@ or cannot complete the requested operation.
 from __future__ import annotations
 
 import base64
+import binascii
 import difflib
 import json
 import shutil
@@ -100,13 +101,14 @@ def get_installation_recommendations() -> list[str]:
 def _json_string(value: Any) -> str:
     if not isinstance(value, dict):
         return ""
-    if isinstance(value.get("text"), str):
-        return value["text"]
+    text_value = value.get("text")
+    if isinstance(text_value, str):
+        return text_value
     encoded = value.get("bytes")
     if isinstance(encoded, str):
         try:
             return base64.b64decode(encoded).decode("utf-8", errors="replace")
-        except (ValueError, base64.binascii.Error):
+        except (ValueError, binascii.Error):
             return ""
     return ""
 
