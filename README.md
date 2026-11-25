@@ -263,6 +263,26 @@ timeout = 300.0
 - `GCLOUD_ACCESS_TOKEN`: Custom OAuth2 access token.
 - `CLI_AGENT_TIMEOUT`: HTTP client timeout in seconds (default: `300.0`).
 
+### Storage Backends
+
+SQLite remains the zero-configuration default. To use Turso, install the optional
+driver and provide both the database URL and token:
+
+```bash
+pip install 'cli-agent[turso]'
+export CLI_AGENT_STORAGE_BACKEND=turso
+export TURSO_DATABASE_URL='libsql://your-database.turso.io'
+export TURSO_AUTH_TOKEN='your-database-token'
+```
+
+The default `TURSO_MODE=replica` keeps a local embedded replica and synchronizes
+it with Turso. Set `TURSO_MODE=remote` to connect directly without a local
+replica; `TURSO_SYNC_INTERVAL` controls replica sync frequency (default: 30
+seconds), and `TURSO_REPLICA_PATH` optionally selects the replica file. The
+authentication token is read only from `TURSO_AUTH_TOKEN`, never from the TOML
+configuration. On first Turso use, the legacy `~/.config/cli-agent/memory.db`
+is migrated transactionally; the source database is left unchanged.
+
 ---
 
 ## Quality & Verification

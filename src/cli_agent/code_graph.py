@@ -6,7 +6,6 @@ Extracts symbols (classes, functions, methods), signatures, docstrings, and rela
 
 import os
 import re
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,9 @@ from typing import Any
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
+from .config import StorageConfig
 from .memory import DEFAULT_DB_PATH, resolve_project_key
+from .storage import StorageConnection, StorageEngine, resolve_store_engine
 
 PY_LANGUAGE = Language(tspython.language())
 
@@ -66,16 +67,25 @@ class SymbolEdge:
 class CodeGraphStore:
     """Persistent SQLite store for AST code symbols and dependency graph edges."""
 
-    def __init__(self, db_path: Path | str | None = None):
-        self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        storage_engine: StorageEngine | None = None,
+        storage_config: StorageConfig | None = None,
+    ):
+        self.storage_engine = resolve_store_engine(
+            DEFAULT_DB_PATH,
+            Path(db_path) if db_path is not None else None,
+            storage_engine,
+            storage_config,
+        )
+        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+    def _get_connection(self) -> StorageConnection:
+        return self.storage_engine.connect()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:

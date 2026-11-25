@@ -7,14 +7,15 @@ to list past sessions and seamlessly resume or continue them via CLI flags or RE
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .config import StorageConfig
 from .memory import DEFAULT_DB_PATH, resolve_project_key
+from .storage import StorageConnection, StorageEngine, resolve_store_engine
 
 
 @dataclass
@@ -82,15 +83,22 @@ class SessionStore:
     Allows listing, updating, querying, and resuming sessions across process restarts.
     """
 
-    def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or DEFAULT_DB_PATH
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        storage_engine: StorageEngine | None = None,
+        storage_config: StorageConfig | None = None,
+    ) -> None:
+        self.storage_engine = resolve_store_engine(
+            DEFAULT_DB_PATH, db_path, storage_engine, storage_config
+        )
+        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _get_connection(self) -> StorageConnection:
+        return self.storage_engine.connect()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:

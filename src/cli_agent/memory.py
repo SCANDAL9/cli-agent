@@ -8,6 +8,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .config import StorageConfig
+from .storage import StorageConnection, StorageEngine, resolve_store_engine
+
 DEFAULT_DB_DIR = Path.home() / ".config" / "cli-agent"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "memory.db"
 
@@ -35,15 +38,22 @@ def resolve_project_key(cwd: Path | None = None) -> str:
 
 
 class MemoryStore:
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        storage_engine: StorageEngine | None = None,
+        storage_config: StorageConfig | None = None,
+    ):
+        self.storage_engine = resolve_store_engine(
+            DEFAULT_DB_PATH, db_path, storage_engine, storage_config
+        )
+        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _get_connection(self) -> StorageConnection:
+        return self.storage_engine.connect()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:
