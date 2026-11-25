@@ -3,8 +3,11 @@ Security policy and Human-in-the-Loop (HITL) permission gate for cli-agent.
 Classifies tool calls by risk level and intercepts potentially destructive operations.
 """
 
+import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any
 
@@ -30,6 +33,7 @@ HIGH_RISK_PATTERNS = [
 ]
 
 COMPILED_HIGH_RISK = [re.compile(p, re.IGNORECASE) for p in HIGH_RISK_PATTERNS]
+PermissionCallback = Callable[[str, dict[str, Any], RiskLevel], bool | Awaitable[bool]]
 
 
 class SecurityPolicy:
@@ -40,11 +44,14 @@ class SecurityPolicy:
     def __init__(
         self,
         auto_approve: bool = False,
-        confirm_callback: Callable[[str, dict[str, Any], RiskLevel], bool] | None = None,
+        confirm_callback: PermissionCallback | None = None,
     ):
         self.auto_approve = auto_approve
         self.confirm_callback = confirm_callback
         self._session_allowlist: set[str] = set()
+        self._confirm_override: ContextVar[PermissionCallback | None] = ContextVar(
+            f"security_confirm_override_{id(self)}", default=None
+        )
 
     def evaluate_risk(self, tool_name: str, arguments: dict[str, Any]) -> RiskLevel:
         """Classifies tool invocation into SAFE, MEDIUM, or HIGH risk."""
@@ -52,6 +59,8 @@ class SecurityPolicy:
             "read_file",
             "list_directory",
             "search_code",
+            "lsp_workspace_diagnostics",
+            "ast_grep_replace",
             "hybrid_search_code",
             "get_symbol_outline",
             "find_symbol_definition",
@@ -97,14 +106,54 @@ class SecurityPolicy:
             return True, "Auto-approve flag enabled for medium risk operations."
 
         # 4. If an interactive confirmation callback is registered, query the human operator
-        if self.confirm_callback is not None:
-            is_confirmed = self.confirm_callback(tool_name, arguments, risk)
+        callback = self._confirm_override.get() or self.confirm_callback
+        if callback is not None:
+            is_confirmed = callback(tool_name, arguments, risk)
+            if inspect.isawaitable(is_confirmed):
+                close = getattr(is_confirmed, "close", None)
+                if callable(close):
+                    close()
+                return False, "Asynchronous approval requires check_permission_async."
             if is_confirmed:
                 return True, "User confirmed tool execution."
             return False, "User denied permission for this action."
 
         # 5. Non-interactive environment with no callback and no auto-approve
         return False, f"Mutating action '{tool_name}' blocked: requires interactive approval."
+
+    async def check_permission_async(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """Async variant that safely awaits context-local approval brokers."""
+        risk = self.evaluate_risk(tool_name, arguments)
+        if risk == RiskLevel.SAFE:
+            return True, "Safe read-only tool auto-permitted."
+        cache_key = self._get_cache_key(tool_name, arguments)
+        if cache_key in self._session_allowlist:
+            return True, f"Action '{cache_key}' pre-approved for active session."
+        if self.auto_approve and risk != RiskLevel.HIGH:
+            return True, "Auto-approve flag enabled for medium risk operations."
+        callback = self._confirm_override.get() or self.confirm_callback
+        if callback is None:
+            return False, f"Mutating action '{tool_name}' blocked: requires interactive approval."
+        try:
+            confirmed = callback(tool_name, arguments, risk)
+            if inspect.isawaitable(confirmed):
+                confirmed = await confirmed
+        except Exception as exc:
+            return False, f"Permission approval failed: {exc}"
+        if confirmed:
+            return True, "User confirmed tool execution."
+        return False, "User denied permission for this action."
+
+    @contextmanager
+    def confirmation_scope(self, callback: PermissionCallback) -> Iterator[None]:
+        """Override confirmation only in this async execution context."""
+        token = self._confirm_override.set(callback)
+        try:
+            yield
+        finally:
+            self._confirm_override.reset(token)
 
     def grant_session_permission(self, tool_name: str, arguments: dict[str, Any]) -> None:
         """Grants recurring permission for this tool or command for the remainder of the session."""

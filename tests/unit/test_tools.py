@@ -6,13 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent import fast_tools
+from cli_agent.lsp import DiagnosticSeverity, LSPDiagnostic, LSPDiagnosticReport
 from cli_agent.tools import (
+    GEMINI_TOOLS_DECLARATIONS,
     edit_file,
     execute_tool,
     list_directory,
+    lsp_workspace_diagnostics,
     read_file,
     run_command,
     search_code,
+    worker_execution_scope,
     write_file,
 )
 
@@ -54,6 +59,36 @@ class TestToolsUnit:
         assert res.get("status") == "success"
         assert res.get("replacements_made") == 1
         assert "return 'antigravity'" in file_path.read_text(encoding="utf-8")
+
+    def test_file_edit_tool_result_keeps_its_existing_schema(self, tmp_path: Path):
+        file_path = tmp_path / "example.txt"
+        file_path.write_text("before\n", encoding="utf-8")
+
+        result = edit_file(str(file_path), target="before", replacement="after")
+
+        assert result == {
+            "status": "success",
+            "path": str(file_path),
+            "replacements_made": 1,
+        }
+
+        write_result = write_file(str(file_path), "replaced\n", overwrite=True)
+        assert write_result == {
+            "status": "success",
+            "path": str(file_path),
+            "bytes_written": len(b"replaced\n"),
+            "lines": 1,
+        }
+
+    def test_write_file_can_overwrite_non_utf8_file_without_private_metadata(self, tmp_path: Path):
+        file_path = tmp_path / "existing.txt"
+        file_path.write_bytes(b"\xff\xfe")
+
+        result = write_file(str(file_path), "replacement\n", overwrite=True)
+
+        assert result["status"] == "success"
+        assert "_terminal_diff" not in result
+        assert file_path.read_text(encoding="utf-8") == "replacement\n"
 
     def test_edit_file_target_not_found(self, tmp_path: Path):
         file_path = tmp_path / "code.py"
@@ -125,6 +160,167 @@ class TestToolsUnit:
         res = search_code("VertexClient", path=str(tmp_path))
         assert res.get("total_matches") == 1
         assert any("VertexClient" in m for m in res.get("matches", []))
+
+    def test_search_code_prefers_native_result_when_available(
+        self, monkeypatch, tmp_path: Path
+    ):
+        expected = {"pattern": "needle", "total_matches": 1, "matches": ["a.py:1: needle"]}
+        observed = {}
+
+        def native_search(pattern, path, file_pattern="*", limit=50):
+            observed.update(pattern=pattern, path=path, file_pattern=file_pattern)
+            return expected
+
+        monkeypatch.setattr(fast_tools, "fast_search_code", native_search)
+
+        result = search_code("needle", path=str(tmp_path), file_pattern="*.py")
+
+        assert result == expected
+        assert observed == {
+            "pattern": "needle",
+            "path": str(tmp_path),
+            "file_pattern": "*.py",
+        }
+
+    def test_search_code_preserves_python_fallback_when_native_unavailable(
+        self, monkeypatch, tmp_path: Path
+    ):
+        (tmp_path / "fallback.py").write_text("Needle in fallback\n", encoding="utf-8")
+        monkeypatch.setattr(fast_tools, "fast_search_code", lambda *args, **kwargs: None)
+
+        result = search_code("needle", path=str(tmp_path))
+
+        assert result["total_matches"] == 1
+        assert result["matches"] == ["fallback.py:1: Needle in fallback"]
+
+    def test_list_directory_prefers_native_result_when_available(
+        self, monkeypatch, tmp_path: Path
+    ):
+        expected = {"path": str(tmp_path), "tree": "📄 native.txt"}
+        observed = {}
+
+        def native_list(path, max_depth):
+            observed.update(path=path, max_depth=max_depth)
+            return expected
+
+        monkeypatch.setattr(fast_tools, "fast_list_directory", native_list)
+
+        result = list_directory(str(tmp_path), max_depth=3)
+
+        assert result == expected
+        assert observed == {"path": str(tmp_path), "max_depth": 3}
+
+    def test_list_directory_preserves_python_fallback_when_fd_unavailable(
+        self, monkeypatch, tmp_path: Path
+    ):
+        (tmp_path / "fallback.txt").write_text("fallback", encoding="utf-8")
+        monkeypatch.setattr(fast_tools, "fast_list_directory", lambda *args, **kwargs: None)
+
+        result = list_directory(str(tmp_path))
+
+        assert "📄 fallback.txt" in result["tree"]
+
+    def test_ast_grep_replace_is_dispatched_and_declared(self, monkeypatch, tmp_path: Path):
+        expected = {"status": "preview", "diff": "diff", "applied": False}
+        observed = {}
+
+        def preview(pattern, replacement, language, path="."):
+            observed.update(
+                pattern=pattern, replacement=replacement, language=language, path=path
+            )
+            return expected
+
+        monkeypatch.setattr(fast_tools, "ast_grep_replace", preview)
+
+        result = execute_tool(
+            "ast_grep_replace",
+            {
+                "pattern": "foo($A)",
+                "replacement": "bar($A)",
+                "language": "python",
+                "path": str(tmp_path),
+            },
+        )
+
+        assert result == expected
+        assert observed["pattern"] == "foo($A)"
+        assert observed["path"] == str(tmp_path)
+        assert any(item["name"] == "ast_grep_replace" for item in GEMINI_TOOLS_DECLARATIONS)
+
+        from cli_agent.security import RiskLevel, SecurityPolicy
+        from cli_agent.team import ROLE_ALLOWED_TOOLS, AgentRole
+
+        assert SecurityPolicy().evaluate_risk("ast_grep_replace", {}) == RiskLevel.SAFE
+        assert "ast_grep_replace" in ROLE_ALLOWED_TOOLS[AgentRole.ARCHITECT]
+        assert "ast_grep_replace" in ROLE_ALLOWED_TOOLS[AgentRole.WORKER]
+
+    def test_lsp_workspace_diagnostics_are_bounded_and_report_errors(
+        self, monkeypatch, tmp_path: Path
+    ):
+        from cli_agent import lsp
+
+        (tmp_path / "first.py").write_text("first = 1\n", encoding="utf-8")
+        nested = tmp_path / "src"
+        nested.mkdir()
+        (nested / "second.py").write_text("second = 2\n", encoding="utf-8")
+        ignored = tmp_path / ".venv"
+        ignored.mkdir()
+        (ignored / "ignored.py").write_text("ignored = 3\n", encoding="utf-8")
+
+        class FakeManager:
+            def check_file_sync(self, file_path: Path, content: str, timeout_ms: float):
+                del content, timeout_ms
+                diagnostics = (
+                    [
+                        LSPDiagnostic(
+                            file_path=str(file_path),
+                            line=1,
+                            column=1,
+                            end_line=1,
+                            end_column=2,
+                            severity=DiagnosticSeverity.ERROR,
+                            message="Invalid syntax",
+                            source="python-ast",
+                            code="SyntaxError",
+                        )
+                    ]
+                    if file_path.name == "first.py"
+                    else []
+                )
+                return LSPDiagnosticReport(
+                    file_path=str(file_path),
+                    uri=file_path.as_uri(),
+                    diagnostics=diagnostics,
+                    server_names=["python-ast"],
+                )
+
+        monkeypatch.setattr(lsp, "get_lsp_manager", lambda *_args: FakeManager())
+        with worker_execution_scope(tmp_path):
+            clean = lsp_workspace_diagnostics("src")
+            result = lsp_workspace_diagnostics(".", max_files=1)
+
+        assert clean["status"] == "success"
+        assert clean["exit_code"] == 0
+        assert clean["checked_files"] == 1
+        assert result["status"] == "failed"
+        assert result["exit_code"] == 1
+        assert result["checked_files"] == 1
+        assert result["truncated"] is True
+        assert result["error_count"] == 1
+        declaration = next(
+            item
+            for item in GEMINI_TOOLS_DECLARATIONS
+            if item["name"] == "lsp_workspace_diagnostics"
+        )
+        assert declaration["parameters"]["properties"]["max_files"]["type"] == "INTEGER"
+        from cli_agent.security import RiskLevel, SecurityPolicy
+        from cli_agent.team import ROLE_ALLOWED_TOOLS, AgentRole
+
+        assert SecurityPolicy().evaluate_risk("lsp_workspace_diagnostics", {}) == RiskLevel.SAFE
+        assert all(
+            "lsp_workspace_diagnostics" in ROLE_ALLOWED_TOOLS[role]
+            for role in (AgentRole.ARCHITECT, AgentRole.WORKER, AgentRole.QA)
+        )
 
     def test_run_command_success_and_timeout(self, tmp_path: Path):
         # Successful command

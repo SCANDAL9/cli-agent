@@ -5,6 +5,7 @@ Verifies credentials, database health, workspace scoping, and endpoint connectiv
 
 from typing import Any
 
+from . import fast_tools
 from .code_graph import CodeGraphStore
 from .memory import MemoryStore, resolve_project_key
 from .token_provider import TokenProvider
@@ -14,6 +15,7 @@ async def run_diagnostics(
     token_provider: TokenProvider | None = None,
     memory_store: MemoryStore | None = None,
     code_graph_store: CodeGraphStore | None = None,
+    preflight_engine: Any | None = None,
 ) -> dict[str, Any]:
     """
     Executes comprehensive system health checks.
@@ -31,6 +33,8 @@ async def run_diagnostics(
         "database_path": str(mem.db_path),
         "issues": [],
     }
+    results["native_accelerators"] = fast_tools.capability_summary()
+    results["native_tool_recommendations"] = fast_tools.get_installation_recommendations()
 
     # 1. Check OAuth2 token availability
     try:
@@ -88,7 +92,7 @@ async def run_diagnostics(
     try:
         from .preflight import PreflightEngine
 
-        pf = PreflightEngine()
+        pf = preflight_engine or PreflightEngine()
         report = pf.run_checks()
         results["preflight_report"] = report
         results["gcloud_account"] = report.account or "Unauthenticated"

@@ -113,7 +113,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/resume": "Resume a previous conversation session",
     "/memories": "List persistent SQLite knowledge memories",
     "/compact": "Compact conversation history context",
-    "/doctor": "Verify authentication, DB, AST, and health",
+    "/doctor": "Verify authentication, DB, AST, native accelerators, and health",
     "/setup": "Launch GCP project onboarding wizard",
     "/model": "Switch or inspect active Vertex AI model",
     "/models": "Explore Vertex AI Model Garden catalog",
@@ -1367,6 +1367,25 @@ class RichMarkdownStreamer:
             lines = args["content"].splitlines()
             self.console.print(f"  [dim cyan]({len(lines)} lines changed in {target})[/dim cyan]")
 
+    def on_tool_result(
+        self, name: str, args: dict[str, Any], terminal_diff: dict[str, str]
+    ) -> None:
+        """Show successful file edits in the interactive terminal only."""
+        if name not in {"write_file", "edit_file"}:
+            return
+        from . import fast_tools
+
+        rendered = fast_tools.format_terminal_diff(
+            terminal_diff["path"], terminal_diff["before"], terminal_diff["after"]
+        )
+        if not rendered:
+            return
+        self.console.print()
+        if "\x1b[" in rendered:
+            self.console.print(Text.from_ansi(rendered), soft_wrap=True)
+        else:
+            self.console.print(Syntax(rendered, "diff", theme="monokai", line_numbers=True))
+
     def finalize(self) -> str:
         self._flush_blocks(finalize=True)
         self.console.print()
@@ -2265,6 +2284,29 @@ async def _run_interactive_session(
                 else "[yellow]Partial[/yellow]",
                 "Autonomous Red-Green-Refactor loop & regression guards",
             )
+            native_tools = diag.get("native_accelerators", {})
+            active_native_tools = [name for name, active in native_tools.items() if active]
+            missing_native_tools = [name for name, active in native_tools.items() if not active]
+            native_status = (
+                "[green]Ready[/green]"
+                if active_native_tools and not missing_native_tools
+                else "[yellow]Partial[/yellow]"
+                if active_native_tools
+                else "[yellow]Unavailable[/yellow]"
+            )
+            native_detail_parts = []
+            if active_native_tools:
+                native_detail_parts.append(f"Active: {', '.join(active_native_tools)}")
+            if missing_native_tools:
+                native_detail_parts.append(f"Missing: {', '.join(missing_native_tools)}")
+            recommendations = diag.get("native_tool_recommendations", [])
+            if recommendations:
+                native_detail_parts.append(f"Install: {recommendations[0]}")
+            table.add_row(
+                "Native Accelerators",
+                native_status,
+                "; ".join(native_detail_parts) or "No installation manager detected",
+            )
             table.add_row(
                 "Hybrid Code Search",
                 "[green]Ready[/green]",
@@ -2417,6 +2459,14 @@ async def _run_interactive_session(
             )
             _streamer.on_tool_call(name, args)
 
+        def _handle_tool_result(
+            name: str,
+            args: dict[str, Any],
+            terminal_diff: dict[str, str],
+            _streamer: RichMarkdownStreamer = streamer,
+        ) -> None:
+            _streamer.on_tool_result(name, args, terminal_diff)
+
         try:
             pinned_footer.pin(
                 activity="● Thinking...",
@@ -2427,7 +2477,9 @@ async def _run_interactive_session(
             status.start()
             status_active = True
             stream_iter = client.stream_chat(
-                conversation_history, on_tool_call=_handle_tool_call
+                conversation_history,
+                on_tool_call=_handle_tool_call,
+                on_tool_result=_handle_tool_result,
             )
             try:
                 first_chunk = await stream_iter.__anext__()
