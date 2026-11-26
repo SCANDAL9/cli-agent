@@ -5,6 +5,7 @@ Unit tests for Wave 5 Phase 3: Headless LSP Semantic Diagnostic Bridge (src/cli_
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -187,6 +188,37 @@ class TestHeadlessLSPClientAndManager:
         try:
             broken_py = tmp_path / "broken_sync.py"
             code = "def bad_func():\n    return missing_ident\n"
+            diagnostic = LSPDiagnostic(
+                file_path=str(broken_py.resolve()),
+                line=2,
+                column=12,
+                end_line=2,
+                end_column=25,
+                severity=DiagnosticSeverity.ERROR,
+                message="'missing_ident' is undefined",
+                source="ruff",
+                code="F821",
+            )
+
+            class ReadyFakeClient:
+                server_name = "ruff"
+                is_ready = True
+
+                async def notify_document(self, uri: str, content: str) -> None:
+                    assert uri == broken_py.as_uri()
+                    assert content == code
+
+                async def wait_for_diagnostics(
+                    self, uri: str, timeout_sec: float
+                ) -> list[LSPDiagnostic]:
+                    assert uri == broken_py.as_uri()
+                    return [diagnostic]
+
+                async def stop(self) -> None:
+                    return None
+
+            # Keep this orchestration test independent of installed LSP servers and startup timing.
+            mgr._clients.append(cast(HeadlessLSPClient, ReadyFakeClient()))
             report = mgr.check_file_sync(broken_py, code, timeout_ms=500.0)
 
             assert report.file_path == str(broken_py.resolve())
