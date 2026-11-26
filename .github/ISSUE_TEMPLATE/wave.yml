@@ -1,0 +1,59 @@
+name: Wave implementation
+description: Propose or track implementation work from an approved capability wave.
+title: "[Wave] "
+labels:
+  - "type:feature"
+body:
+  - type: dropdown
+    id: wave
+    attributes:
+      label: Wave
+      description: Select the existing capability wave this issue covers.
+      options:
+        - "Wave 7 — Semantic Intelligence"
+        - "Wave 8 — Sandboxing, WASM, and Distributed Workers"
+    validations:
+      required: true
+  - type: input
+    id: proposal
+    attributes:
+      label: Proposal document
+      description: Path to the approved wave proposal in this repository.
+      placeholder: docs/wave7/00_wave7_executive_architecture.md
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope to implement
+      description: Identify the proposal requirements this issue covers and any explicit exclusions.
+      placeholder: Describe the implementation scope and link relevant proposal sections.
+    validations:
+      required: true
+      min_length: 20
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: List observable outcomes that demonstrate this wave is complete.
+      placeholder: Include behavior, compatibility, and security expectations from the proposal.
+    validations:
+      required: true
+      min_length: 20
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: List the focused tests and repository checks required before delivery.
+      placeholder: Name the test commands and any measurable proposal targets.
+    validations:
+      required: true
+      min_length: 10
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and decisions
+      description: Record resolved design decisions or prerequisites; use "None" when there are no additional dependencies.
+      placeholder: Include only decisions required to safely implement this wave.
+    validations:
+      required: false
