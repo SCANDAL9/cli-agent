@@ -5,6 +5,7 @@ Unit tests for Wave 5 Phase 3: Headless LSP Semantic Diagnostic Bridge (src/cli_
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -187,6 +188,37 @@ class TestHeadlessLSPClientAndManager:
         try:
             broken_py = tmp_path / "broken_sync.py"
             code = "def bad_func():\n    return missing_ident\n"
+            diagnostic = LSPDiagnostic(
+                file_path=str(broken_py.resolve()),
+                line=2,
+                column=12,
+                end_line=2,
+                end_column=25,
+                severity=DiagnosticSeverity.ERROR,
+                message="'missing_ident' is undefined",
+                source="ruff",
+                code="F821",
+            )
+
+            class ReadyFakeClient:
+                server_name = "ruff"
+                is_ready = True
+
+                async def notify_document(self, uri: str, content: str) -> None:
+                    assert uri == broken_py.as_uri()
+                    assert content == code
+
+                async def wait_for_diagnostics(
+                    self, uri: str, timeout_sec: float
+                ) -> list[LSPDiagnostic]:
+                    assert uri == broken_py.as_uri()
+                    return [diagnostic]
+
+                async def stop(self) -> None:
+                    return None
+
+            # Keep this orchestration test independent of installed LSP servers and startup timing.
+            mgr._clients.append(cast(HeadlessLSPClient, ReadyFakeClient()))
             report = mgr.check_file_sync(broken_py, code, timeout_ms=500.0)
 
             assert report.file_path == str(broken_py.resolve())
@@ -243,6 +275,47 @@ class TestToolEnrichmentIntegration:
 
 @pytest.mark.unit
 class TestHeadlessLSPClientEdgeCases:
+    def test_client_discards_diagnostics_for_older_document_version(self, tmp_path: Path) -> None:
+        client = HeadlessLSPClient(
+            server_name="test",
+            command=["echo"],
+            workspace_root=tmp_path,
+        )
+        uri = (tmp_path / "sample.py").as_uri()
+        client._opened_docs[uri] = 2
+
+        client._dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "version": 1,
+                    "diagnostics": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                            "severity": 1,
+                            "message": "stale syntax error",
+                            "code": "SyntaxError",
+                        }
+                    ],
+                },
+            }
+        )
+
+        assert uri not in client._diagnostics_cache
+        client._dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {"uri": uri, "version": 2, "diagnostics": []},
+            }
+        )
+        assert client._diagnostics_cache[uri] == []
+
     @pytest.mark.asyncio
     async def test_find_executable_nonexistent_returns_none(self) -> None:
         assert _find_executable("completely_nonexistent_binary_xyz_123") is None

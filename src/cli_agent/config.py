@@ -6,7 +6,7 @@ Loads settings from ~/.config/cli-agent/config.toml with environment variable fa
 import os
 import subprocess
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,62 @@ class AgentConfig:
     auto_approve: bool = False
     timeout: float = 300.0
     effort: str = "medium"
+
+
+@dataclass(frozen=True)
+class StorageConfig:
+    """Storage backend settings; authentication tokens are never loaded from TOML."""
+
+    backend: str = "auto"
+    turso_database_url: str | None = None
+    turso_auth_token: str | None = field(default=None, repr=False)
+    turso_mode: str = "replica"
+    sync_interval: float = 30.0
+    replica_path: Path | None = None
+
+
+def load_storage_config(config_path: Path | None = None) -> StorageConfig:
+    """Loads storage settings, reading Turso credentials only from the environment."""
+    path = config_path or DEFAULT_CONFIG_FILE
+    file_data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            with open(path, "rb") as f:
+                file_data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            file_data = {}
+
+    raw_storage = file_data.get("storage")
+    storage: dict[str, Any] = raw_storage if isinstance(raw_storage, dict) else {}
+    backend = str(os.getenv("CLI_AGENT_STORAGE_BACKEND") or storage.get("backend") or "auto")
+    backend = backend.strip().lower()
+    if backend not in {"auto", "sqlite", "turso"}:
+        raise ValueError("CLI_AGENT_STORAGE_BACKEND must be 'auto', 'sqlite', or 'turso'.")
+
+    turso_mode = str(os.getenv("TURSO_MODE") or storage.get("turso_mode") or "replica")
+    turso_mode = turso_mode.strip().lower()
+    if turso_mode not in {"replica", "remote"}:
+        raise ValueError("TURSO_MODE must be 'replica' or 'remote'.")
+
+    raw_interval = os.getenv("TURSO_SYNC_INTERVAL") or storage.get("sync_interval", 30.0)
+    try:
+        sync_interval = float(raw_interval)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TURSO_SYNC_INTERVAL must be a positive number of seconds.") from exc
+    if sync_interval <= 0:
+        raise ValueError("TURSO_SYNC_INTERVAL must be a positive number of seconds.")
+
+    raw_replica = os.getenv("TURSO_REPLICA_PATH") or storage.get("replica_path")
+    replica_path = Path(raw_replica).expanduser() if raw_replica else None
+
+    return StorageConfig(
+        backend=backend,
+        turso_database_url=os.getenv("TURSO_DATABASE_URL") or storage.get("database_url"),
+        turso_auth_token=os.getenv("TURSO_AUTH_TOKEN"),
+        turso_mode=turso_mode,
+        sync_interval=sync_interval,
+        replica_path=replica_path,
+    )
 
 
 def load_config(config_path: Path | None = None) -> AgentConfig:

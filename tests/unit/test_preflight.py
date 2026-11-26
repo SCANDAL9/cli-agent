@@ -233,6 +233,33 @@ class TestPreflightEngine:
             assert cfg_file.exists()
             assert 'project = "auto-discovered-proj"' in cfg_file.read_text(encoding="utf-8")
 
+    def test_preflight_stops_when_no_project_can_be_resolved(self, tmp_path: Path) -> None:
+        engine = PreflightEngine(config_path=tmp_path / "config.toml")
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+            patch.object(engine.session_mgr, "get_active_account", return_value="dev@corp.com"),
+            patch.object(engine.project_selector, "list_accessible_projects", return_value=[]),
+            patch.object(engine.service_mgr, "is_api_enabled") as check_service,
+            patch.object(engine.billing_validator, "check_billing") as check_billing,
+            patch.object(engine.iam_validator, "check_permissions") as check_iam,
+            patch("cli_agent.preflight.os.getenv", return_value=None),
+            patch(
+                "cli_agent.preflight.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="(unset)\n"),
+            ),
+        ):
+            report = engine.run_checks(project_id=None, auto_fix=False)
+
+        project_item = next(item for item in report.items if item.name == "Project Resolution")
+        assert report.passed is False
+        assert project_item.status == PreflightStatus.FAIL
+        assert project_item.detail == "No active Google Cloud project configured."
+        assert project_item.remediation_cmd == "gcloud config set project <PROJECT_ID>"
+        check_service.assert_not_called()
+        check_billing.assert_not_called()
+        check_iam.assert_not_called()
+
     def test_unauthenticated_session_fails(self) -> None:
         engine = PreflightEngine()
         with (

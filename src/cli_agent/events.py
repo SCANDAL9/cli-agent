@@ -25,6 +25,7 @@ class EventTopic(StrEnum):
 
     TOKEN_STREAM = "token.stream"
     SWARM_NODE_STATE = "swarm.node_state"
+    WORKFLOW_STEP_STATE = "workflow.step_state"
     WORKTREE_DIFF_UPDATED = "worktree.diff_updated"
     SUBPROC_LOG = "subproc.log"
     CIRCUIT_HEALTH = "circuit.health"

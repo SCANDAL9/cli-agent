@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +27,9 @@ from .security import SecurityPolicy
 from .token_provider import TokenProvider
 from .tools import (
     GEMINI_TOOLS_DECLARATIONS,
+    _check_write_allowed,
+    _enforce_write_scope,
+    _resolve_tool_path,
     execute_tool,
     set_code_graph_store,
     set_memory_store,
@@ -37,6 +41,55 @@ DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 DEFAULT_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+
+
+def _capture_tool_edit_snapshot(name: str, arguments: dict[str, Any]) -> tuple[str, str] | None:
+    """Capture a permitted text target before an interactive file edit."""
+    if name not in {"write_file", "edit_file"}:
+        return None
+    raw_path = arguments.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        resolved = _resolve_tool_path(raw_path)
+        if _check_write_allowed(resolved):
+            return None
+        _enforce_write_scope(raw_path, resolved)
+        if not resolved.exists():
+            return str(resolved), ""
+        if not resolved.is_file():
+            return None
+        return str(resolved), resolved.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _notify_tool_result(
+    name: str,
+    arguments: dict[str, Any],
+    result: Any,
+    callback: Callable[[str, dict[str, Any], dict[str, str]], None] | None,
+    previous_edit: tuple[str, str] | None,
+) -> Any:
+    """Render successful edit diffs in the UI without changing model tool results."""
+    if (
+        callback is None
+        or previous_edit is None
+        or not isinstance(result, dict)
+        or result.get("status") != "success"
+    ):
+        return result
+    path, before = previous_edit
+    try:
+        after = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return result
+    if before != after:
+        try:
+            callback(name, arguments, {"path": path, "before": before, "after": after})
+        except Exception:
+            pass
+    return result
 
 
 class VertexAgentClient:
@@ -168,6 +221,7 @@ Guidelines:
         max_turns: int = 10,
         tools_declarations: list[dict[str, Any]] | None = None,
         system_instruction: str | None = None,
+        on_tool_result: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
     ) -> str:
         """Executes the agent tool-calling loop until a final text response is produced."""
         headers = await self._get_headers()
@@ -248,12 +302,20 @@ Guidelines:
                     if on_tool_call:
                         on_tool_call(fn_name, fn_args)
 
-                    allowed, reason = self.security_policy.check_permission(fn_name, fn_args)
+                    allowed, reason = await self.security_policy.check_permission_async(
+                        fn_name, fn_args
+                    )
+                    previous_edit = None
                     if not allowed:
                         result = {"error": f"Tool execution rejected by security policy: {reason}"}
                     else:
+                        if on_tool_result is not None:
+                            previous_edit = _capture_tool_edit_snapshot(fn_name, fn_args)
                         tool_res = execute_tool(fn_name, fn_args)
                         result = await tool_res if asyncio.iscoroutine(tool_res) else tool_res
+                    result = _notify_tool_result(
+                        fn_name, fn_args, result, on_tool_result, previous_edit
+                    )
 
                     tool_response_parts.append(
                         {
@@ -279,6 +341,7 @@ Guidelines:
         max_turns: int = 50,
         tools_declarations: list[dict[str, Any]] | None = None,
         system_instruction: str | None = None,
+        on_tool_result: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Executes the agent loop while yielding text chunks incrementally via SSE.
@@ -434,12 +497,20 @@ Guidelines:
                     if on_tool_call:
                         on_tool_call(fn_name, fn_args)
 
-                    allowed, reason = self.security_policy.check_permission(fn_name, fn_args)
+                    allowed, reason = await self.security_policy.check_permission_async(
+                        fn_name, fn_args
+                    )
+                    previous_edit = None
                     if not allowed:
                         result = {"error": f"Tool execution rejected by security policy: {reason}"}
                     else:
+                        if on_tool_result is not None:
+                            previous_edit = _capture_tool_edit_snapshot(fn_name, fn_args)
                         tool_res = execute_tool(fn_name, fn_args)
                         result = await tool_res if asyncio.iscoroutine(tool_res) else tool_res
+                    result = _notify_tool_result(
+                        fn_name, fn_args, result, on_tool_result, previous_edit
+                    )
 
                     tool_response_parts.append(
                         {

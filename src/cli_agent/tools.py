@@ -253,6 +253,12 @@ def list_directory(path: str = ".", max_depth: int = 2) -> dict[str, Any]:
         if not base_path.is_dir():
             return {"error": f"Path '{path}' is not a directory."}
 
+        from . import fast_tools
+
+        native_result = fast_tools.fast_list_directory(str(base_path), max_depth=max_depth)
+        if native_result is not None:
+            return native_result
+
         entries: list[str] = []
         ignored_names = {".git", ".venv", "node_modules", "__pycache__", ".next", "dist", "build"}
 
@@ -288,6 +294,14 @@ def search_code(pattern: str, path: str = ".", file_pattern: str = "*") -> dict[
         if not base_path.exists():
             return {"error": f"Path '{path}' does not exist."}
 
+        from . import fast_tools
+
+        native_result = fast_tools.fast_search_code(
+            pattern, path=str(base_path), file_pattern=file_pattern
+        )
+        if native_result is not None:
+            return native_result
+
         regex = re.compile(pattern, re.IGNORECASE)
         results = []
         ignored_dirs = {".git", ".venv", "node_modules", "__pycache__", ".next", "dist", "build"}
@@ -318,6 +332,105 @@ def search_code(pattern: str, path: str = ".", file_pattern: str = "*") -> dict[
         }
     except Exception as e:
         return {"error": f"Failed searching code for '{pattern}': {str(e)}"}
+
+
+def lsp_workspace_diagnostics(
+    path: str = ".", max_files: int = 250, timeout_ms: int = 50
+) -> dict[str, Any]:
+    """Collect bounded Python LSP/AST diagnostics without changing workspace files."""
+    try:
+        if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 1:
+            return {"status": "failed", "exit_code": 1, "error": "max_files must be positive."}
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or not 1 <= timeout_ms <= 1000
+        ):
+            return {
+                "status": "failed",
+                "exit_code": 1,
+                "error": "timeout_ms must be between 1 and 1000.",
+            }
+        base_path = _resolve_tool_path(path)
+        if not base_path.exists():
+            return {"status": "failed", "exit_code": 1, "error": f"Path '{path}' does not exist."}
+        if base_path.is_file() and base_path.suffix != ".py":
+            return {
+                "status": "failed",
+                "exit_code": 1,
+                "error": "LSP diagnostics require Python files.",
+            }
+
+        candidates: list[Path] = []
+        if base_path.is_file():
+            candidates = [base_path]
+            truncated = False
+        else:
+            truncated = False
+            ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build"}
+            for root, directories, filenames in os.walk(base_path):
+                directories[:] = sorted(
+                    name for name in directories if name not in ignored and not name.startswith(".")
+                )
+                for filename in sorted(filenames):
+                    if not filename.endswith(".py"):
+                        continue
+                    candidates.append(Path(root) / filename)
+                    if len(candidates) > min(max_files, 1000):
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            candidates = candidates[: min(max_files, 1000)]
+
+        from .lsp import get_lsp_manager
+
+        manager = get_lsp_manager(base_path if base_path.is_dir() else base_path.parent)
+        reports = []
+        scan_errors: list[str] = []
+        for file_path in candidates:
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+                if len(content.encode("utf-8")) > 1_000_000:
+                    scan_errors.append(f"{file_path}: file exceeds the 1 MB diagnostic limit")
+                    continue
+                report = manager.check_file_sync(file_path, content, timeout_ms=timeout_ms)
+                reports.append(report)
+            except OSError as exc:
+                scan_errors.append(f"{file_path}: {exc}")
+
+        diagnostics = [
+            {"file_path": report.file_path, **diagnostic.to_dict()}
+            for report in reports
+            for diagnostic in report.diagnostics
+        ][:500]
+        error_count = sum(report.error_count for report in reports)
+        warning_count = sum(report.warning_count for report in reports)
+        failed = error_count > 0 or bool(scan_errors)
+        return {
+            "status": "failed" if failed else "success",
+            "exit_code": 1 if failed else 0,
+            "checked_files": len(reports),
+            "truncated": truncated,
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "scan_errors": scan_errors,
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        return {"status": "failed", "exit_code": 1, "error": str(exc)}
+
+
+def ast_grep_replace(
+    pattern: str,
+    replacement: str,
+    language: str,
+    path: str = ".",
+) -> dict[str, Any]:
+    """Previews an AST-aware rewrite without applying changes to project files."""
+    from . import fast_tools
+
+    return fast_tools.ast_grep_replace(pattern, replacement, language, path)
 
 
 async def hybrid_search_code(query: str, limit: int = 5) -> dict[str, Any]:
@@ -855,6 +968,8 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "read_file": read_file,
     "list_directory": list_directory,
     "search_code": search_code,
+    "lsp_workspace_diagnostics": lsp_workspace_diagnostics,
+    "ast_grep_replace": ast_grep_replace,
     "hybrid_search_code": hybrid_search_code,
     "save_memory": save_memory,
     "search_memory": search_memory,
@@ -945,6 +1060,50 @@ GEMINI_TOOLS_DECLARATIONS = [
                 },
             },
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "lsp_workspace_diagnostics",
+        "description": "Collects bounded Python LSP and AST diagnostics without modifying files.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {
+                    "type": "STRING",
+                    "description": "Python file or workspace directory to inspect.",
+                },
+                "max_files": {
+                    "type": "INTEGER",
+                    "description": "Maximum Python files to inspect (default: 250; maximum: 1000).",
+                },
+                "timeout_ms": {
+                    "type": "INTEGER",
+                    "description": "Per-file LSP diagnostic wait budget (default: 50 ms).",
+                },
+            },
+        },
+    },
+    {
+        "name": "ast_grep_replace",
+        "description": "Previews a structural AST rewrite as a diff; it never modifies files.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "pattern": {"type": "STRING", "description": "ast-grep structural pattern."},
+                "replacement": {
+                    "type": "STRING",
+                    "description": "Replacement pattern to preview.",
+                },
+                "language": {
+                    "type": "STRING",
+                    "description": "Language used to parse and match the pattern.",
+                },
+                "path": {
+                    "type": "STRING",
+                    "description": "File or directory to inspect (default: '.').",
+                },
+            },
+            "required": ["pattern", "replacement", "language"],
         },
     },
     {

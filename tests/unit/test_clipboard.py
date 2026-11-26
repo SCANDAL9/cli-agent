@@ -85,6 +85,73 @@ def test_read_clipboard_image_wayland(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
+def test_read_clipboard_image_wayland_uri_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    image_path = tmp_path / "copied.png"
+    image_path.write_bytes(SAMPLE_PNG)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        if "--list-types" in cmd:
+            return SimpleNamespace(returncode=0, stdout="text/uri-list\n")
+        if "--type" in cmd and "text/uri-list" in cmd:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"# copied from file manager\n{image_path.as_uri()}\n",
+            )
+        return SimpleNamespace(returncode=1, stdout=b"")
+
+    with (
+        patch(
+            "cli_agent.clipboard.shutil.which",
+            side_effect=lambda command: "/usr/bin/wl-paste" if command == "wl-paste" else None,
+        ),
+        patch("cli_agent.clipboard.subprocess.run", side_effect=fake_run),
+    ):
+        assert read_clipboard_image() == ("image/png", SAMPLE_PNG)
+
+
+@pytest.mark.unit
+def test_read_clipboard_image_x11_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        if "TARGETS" in cmd:
+            return SimpleNamespace(returncode=0, stdout="TARGETS\nimage/png\n")
+        if "image/png" in cmd:
+            return SimpleNamespace(returncode=0, stdout=SAMPLE_PNG)
+        return SimpleNamespace(returncode=1, stdout=b"")
+
+    with (
+        patch(
+            "cli_agent.clipboard.shutil.which",
+            side_effect=lambda command: "/usr/bin/xclip" if command == "xclip" else None,
+        ),
+        patch("cli_agent.clipboard.subprocess.run", side_effect=fake_run),
+    ):
+        assert read_clipboard_image() == ("image/png", SAMPLE_PNG)
+
+
+@pytest.mark.unit
+def test_read_clipboard_image_macos_pngpaste(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        assert cmd == ["pngpaste", "-"]
+        return SimpleNamespace(returncode=0, stdout=SAMPLE_PNG)
+
+    with (
+        patch(
+            "cli_agent.clipboard.shutil.which",
+            side_effect=lambda command: "/usr/bin/pngpaste" if command == "pngpaste" else None,
+        ),
+        patch("cli_agent.clipboard.subprocess.run", side_effect=fake_run),
+    ):
+        assert read_clipboard_image() == ("image/png", SAMPLE_PNG)
+
+
+@pytest.mark.unit
 def test_read_clipboard_text_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
 

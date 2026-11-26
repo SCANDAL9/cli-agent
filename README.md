@@ -239,6 +239,36 @@ The agent interacts with your workstation via atomic tools:
 - **`save_memory`**: Persist decisions, discoveries, conventions, or bug fixes across sessions.
 - **`search_memory`**: Query persistent memories using full-text search.
 
+### Declarative Workflows
+
+Workflows can be defined as TOML or YAML files in `.cli-agent/workflows/`; user-level
+recipes live in `~/.config/cli-agent/workflows/`. Workspace definitions override
+user recipes, which override the four bundled recipes. Use:
+
+```text
+/workflow list
+/workflow describe strict-tdd
+/workflow run strict-tdd feature_description="Add retry handling" target_module=src/cli_agent/client.py test_name=test_retry_limit
+/workflow abort
+```
+
+`/workflow list` shows each recipe's description and inputs. `/workflow describe <id>`
+shows step dependencies and verification gates. Bundled recipes cover strict TDD
+(including a Python AST parse gate), code health (secret scan, formatting/linting,
+type checking, and bounded LSP diagnostics), security review, and dependency auditing
+(outdated/unused packages plus known vulnerability advisories). The dependency audit
+uses [`uvx` and `uv run --with`](https://docs.astral.sh/uv/guides/tools/) to obtain its
+audit tools, including [pip-audit](https://github.com/pypa/pip-audit), and may contact
+configured package and advisory services; the normal workflow permission prompt must
+approve each command.
+
+Each run starts from an isolated Git worktree that includes tracked edits and
+visible untracked files from the current workspace. Successful runs leave their
+branch, checkpoint tag, and worktree for inspection; failures and aborts remove
+only that run's checkpoint, leaving the original workspace untouched. Shell and verification
+commands pass through the existing permission policy. Runs and step outcomes are
+recorded in the configured storage backend.
+
 ---
 
 ## Configuration
@@ -262,6 +292,26 @@ timeout = 300.0
 - `GEMINI_MODEL`: Model name (default: `gemini-3.8-flash`).
 - `GCLOUD_ACCESS_TOKEN`: Custom OAuth2 access token.
 - `CLI_AGENT_TIMEOUT`: HTTP client timeout in seconds (default: `300.0`).
+
+### Storage Backends
+
+SQLite remains the zero-configuration default. To use Turso, install the optional
+driver and provide both the database URL and token:
+
+```bash
+pip install 'cli-agent[turso]'
+export CLI_AGENT_STORAGE_BACKEND=turso
+export TURSO_DATABASE_URL='libsql://your-database.turso.io'
+export TURSO_AUTH_TOKEN='your-database-token'
+```
+
+The default `TURSO_MODE=replica` keeps a local embedded replica and synchronizes
+it with Turso. Set `TURSO_MODE=remote` to connect directly without a local
+replica; `TURSO_SYNC_INTERVAL` controls replica sync frequency (default: 30
+seconds), and `TURSO_REPLICA_PATH` optionally selects the replica file. The
+authentication token is read only from `TURSO_AUTH_TOKEN`, never from the TOML
+configuration. On first Turso use, the legacy `~/.config/cli-agent/memory.db`
+is migrated transactionally; the source database is left unchanged.
 
 ---
 

@@ -31,6 +31,7 @@ def test_slash_commands_include_wave4() -> None:
     assert "/pr" in SLASH_COMMANDS
     assert "/tui" in SLASH_COMMANDS
     assert "/voice" in SLASH_COMMANDS
+    assert "/workflow" in SLASH_COMMANDS
 
 
 def test_print_banner_and_show_memories(tmp_path: Path) -> None:

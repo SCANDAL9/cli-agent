@@ -1,6 +1,9 @@
 """Unit tests for Autonomous GitHub & GitLab PR/MR Engine (Wave 4 Milestone 2)."""
 
+import io
 import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -17,6 +20,7 @@ from cli_agent.pr import (
     PRMetadata,
     PRSynthesizer,
     SymbolDelta,
+    default_http_client,
     detect_git_host_provider,
     parse_origin_url,
     sanitize_ci_log,
@@ -176,6 +180,53 @@ def test_github_provider_rest_fallback(tmp_path: Path) -> None:
     assert pr.head_sha == "sha-888"
 
 
+def test_github_provider_finds_existing_pr_via_rest_fallback(tmp_path: Path) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def fake_cmd_runner(args: list[str], cwd: Path) -> tuple[int, str, str]:
+        return 127, "", "gh: command not found"
+
+    def fake_http_client(
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None,
+        headers: dict[str, str],
+    ) -> tuple[int, str]:
+        requests.append((method, url))
+        return 200, json.dumps(
+            [
+                {
+                    "number": 42,
+                    "title": "feat(existing): provider fallback",
+                    "body": "Existing description",
+                    "html_url": "https://github.com/acme/agent/pull/42",
+                    "head": {"sha": "existing-head"},
+                    "draft": True,
+                }
+            ]
+        )
+
+    provider = GitHubProvider(
+        "acme/agent",
+        tmp_path,
+        command_runner=fake_cmd_runner,
+        http_client=fake_http_client,
+    )
+
+    pr = provider.find_existing_pr("feat/existing", "main")
+
+    assert pr is not None
+    assert pr.number == 42
+    assert pr.title == "feat(existing): provider fallback"
+    assert pr.body == "Existing description"
+    assert pr.url == "https://github.com/acme/agent/pull/42"
+    assert pr.source_branch == "feat/existing"
+    assert pr.target_branch == "main"
+    assert pr.head_sha == "existing-head"
+    assert pr.draft is True
+    assert len(requests) == 1 and requests[0][0] == "GET"
+
+
 def test_github_ci_status_and_failed_logs(tmp_path: Path) -> None:
     check_runs_data = json.dumps(
         {
@@ -221,6 +272,34 @@ def test_github_ci_status_and_failed_logs(tmp_path: Path) -> None:
     assert "\x1b" not in logs[0].sanitized_log_tail
 
 
+@pytest.mark.parametrize(
+    ("check_run", "expected"),
+    [
+        ({"status": "completed", "conclusion": "cancelled"}, CIStatus.CANCELLED),
+        ({"status": "queued", "conclusion": None}, CIStatus.PENDING),
+        ({"status": "waiting", "conclusion": None}, CIStatus.PENDING),
+        ({"status": "in_progress", "conclusion": None}, CIStatus.RUNNING),
+        ({"status": "completed", "conclusion": "success"}, CIStatus.SUCCESS),
+    ],
+)
+def test_github_provider_maps_ci_check_run_states(
+    tmp_path: Path, check_run: dict[str, Any], expected: CIStatus
+) -> None:
+    response = json.dumps({"check_runs": [check_run]})
+
+    def fake_http_client(
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None,
+        headers: dict[str, str],
+    ) -> tuple[int, str]:
+        return 200, response
+
+    provider = GitHubProvider("acme/agent", tmp_path, http_client=fake_http_client)
+
+    assert provider.get_ci_status(42, "head-sha") == expected
+
+
 def test_gitlab_provider_cli_and_rest_fallback(tmp_path: Path) -> None:
     # CLI Missing -> Fallback to REST v4
     def fake_cmd_runner(args: list[str], cwd: Path) -> tuple[int, str, str]:
@@ -263,6 +342,61 @@ def test_gitlab_provider_cli_and_rest_fallback(tmp_path: Path) -> None:
     assert mr.number == 108
     assert mr.title == "Draft: feat(gitlab): new MR"
     assert mr.url == "https://gitlab.com/group/repo/-/merge_requests/108"
+
+
+def test_gitlab_provider_updates_existing_mr_through_rest_fallback(tmp_path: Path) -> None:
+    requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def fake_cmd_runner(args: list[str], cwd: Path) -> tuple[int, str, str]:
+        return 127, "", "glab: command not found"
+
+    def fake_http_client(
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None,
+        headers: dict[str, str],
+    ) -> tuple[int, str]:
+        requests.append((method, url, payload))
+        if method == "GET" and "merge_requests" in url:
+            return 200, json.dumps(
+                [
+                    {
+                        "iid": 108,
+                        "title": "Old title",
+                        "description": "Old description",
+                        "web_url": "https://gitlab.com/group/repo/-/merge_requests/108",
+                        "sha": "existing-sha",
+                    }
+                ]
+            )
+        if method == "PUT":
+            return 200, "{}"
+        return 404, "{}"
+
+    provider = GitLabProvider(
+        "group/repo",
+        tmp_path,
+        command_runner=fake_cmd_runner,
+        http_client=fake_http_client,
+    )
+
+    mr = provider.create_or_update_pr(
+        title="feat(gitlab): updated MR",
+        body="Updated description",
+        source_branch="feat/existing",
+        target_branch="main",
+    )
+
+    assert mr.number == 108
+    assert mr.title == "feat(gitlab): updated MR"
+    assert mr.body == "Updated description"
+    assert mr.url == "https://gitlab.com/group/repo/-/merge_requests/108"
+    assert mr.head_sha == "existing-sha"
+    assert [request[0] for request in requests] == ["GET", "PUT"]
+    assert requests[1][2] == {
+        "title": "feat(gitlab): updated MR",
+        "description": "Updated description",
+    }
 
 
 def test_pr_synthesizer_symbol_deltas_and_iso_checklist(tmp_path: Path) -> None:
@@ -408,6 +542,82 @@ def test_ci_watcher_max_heal_attempts_cap() -> None:
     assert result.final_status == CIStatus.FAILED
     assert result.heal_attempts_used == 3
     assert len(result.commit_shas_pushed) == 3
+
+
+def test_default_http_client_builds_json_request_and_decodes_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class FakeResponse:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"accepted": true}'
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int):
+        observed["request"] = request
+        observed["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("cli_agent.pr.urllib.request.urlopen", fake_urlopen)
+    status, body = default_http_client(
+        "POST",
+        "https://api.example.test/pulls",
+        {"title": "Test pull request"},
+        {"Private-Token": "test-token"},
+    )
+
+    request = observed["request"]
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert status == 201
+    assert json.loads(body) == {"accepted": True}
+    assert request.get_method() == "POST"
+    assert json.loads(request.data.decode("utf-8")) == {"title": "Test pull request"}
+    assert headers["content-type"] == "application/json"
+    assert headers["private-token"] == "test-token"
+    assert observed["timeout"] == 30
+
+
+def test_default_http_client_returns_http_error_status_and_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = urllib.error.HTTPError(
+        "https://api.example.test/pulls",
+        429,
+        "rate limited",
+        hdrs=None,
+        fp=io.BytesIO(b"rate limit exceeded"),
+    )
+
+    def fake_urlopen(_request: urllib.request.Request, timeout: int):
+        raise error
+
+    monkeypatch.setattr("cli_agent.pr.urllib.request.urlopen", fake_urlopen)
+
+    assert default_http_client("GET", "https://api.example.test/pulls") == (
+        429,
+        "rate limit exceeded",
+    )
+
+
+def test_default_http_client_normalizes_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_urlopen(_request: urllib.request.Request, timeout: int):
+        raise OSError("connection dropped")
+
+    monkeypatch.setattr("cli_agent.pr.urllib.request.urlopen", fake_urlopen)
+    status, body = default_http_client("GET", "https://api.example.test/pulls")
+
+    assert status == 500
+    assert json.loads(body) == {"error": "connection dropped"}
 
 
 def test_default_subprocess_runner_real(tmp_path: Path) -> None:

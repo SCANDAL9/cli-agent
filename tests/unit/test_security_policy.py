@@ -97,3 +97,52 @@ class TestSecurityPolicy:
         allowed_after, reason = policy.check_permission("run_command", args)
         assert allowed_after is True
         assert "pre-approved" in reason
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_permission_awaits_confirmation_callback():
+    observed: list[tuple[str, RiskLevel]] = []
+
+    async def approve(tool_name, _arguments, risk):
+        observed.append((tool_name, risk))
+        return True
+
+    policy = SecurityPolicy(auto_approve=False, confirm_callback=approve)
+    allowed, reason = await policy.check_permission_async(
+        "write_file", {"path": "result.py", "content": "value = 1\n"}
+    )
+
+    assert allowed is True
+    assert reason == "User confirmed tool execution."
+    assert observed == [("write_file", RiskLevel.MEDIUM)]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_permission_reports_denial_callback_errors_and_missing_approval():
+    async def deny(_tool_name, _arguments, _risk):
+        return False
+
+    denied, denial_reason = await SecurityPolicy(confirm_callback=deny).check_permission_async(
+        "write_file", {"path": "result.py", "content": "value = 1\n"}
+    )
+    assert denied is False
+    assert denial_reason == "User denied permission for this action."
+
+    def fail(_tool_name, _arguments, _risk):
+        raise RuntimeError("approval dialog closed")
+
+    failed, failure_reason = await SecurityPolicy(confirm_callback=fail).check_permission_async(
+        "write_file", {"path": "result.py", "content": "value = 1\n"}
+    )
+    assert failed is False
+    assert failure_reason == "Permission approval failed: approval dialog closed"
+
+    blocked, blocked_reason = await SecurityPolicy().check_permission_async(
+        "write_file", {"path": "result.py", "content": "value = 1\n"}
+    )
+    assert blocked is False
+    assert blocked_reason == (
+        "Mutating action 'write_file' blocked: requires interactive approval."
+    )

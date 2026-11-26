@@ -21,6 +21,19 @@ class MockFailingTokenProvider(TokenProvider):
         raise RuntimeError("gcloud command not found")
 
 
+class MockHealthyPreflightEngine:
+    def run_checks(self):
+        from cli_agent.preflight import PreflightReport
+
+        return PreflightReport(
+            items=[],
+            passed=True,
+            has_warnings=False,
+            account="mock-user@example.com",
+            project="mock-project-id",
+        )
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestDoctor:
@@ -32,6 +45,7 @@ class TestDoctor:
         report = await run_diagnostics(
             token_provider=MockHealthyTokenProvider(),
             memory_store=store,
+            preflight_engine=MockHealthyPreflightEngine(),
         )
 
         assert report["healthy"] is True
