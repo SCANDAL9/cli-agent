@@ -136,6 +136,49 @@ class TestFastASTSyntaxCheckFallback:
 @pytest.mark.unit
 class TestHeadlessLSPClientAndManager:
     @pytest.mark.asyncio
+    async def test_code_action_request_preserves_position_diagnostics_and_open_buffer(
+        self, tmp_path: Path
+    ) -> None:
+        manager = HeadlessLSPManager.__new__(HeadlessLSPManager)
+        observed: dict[str, Any] = {}
+
+        class FakeClient:
+            server_name = "fake-lsp"
+            is_ready = True
+
+            async def notify_document(self, uri: str, content: str) -> None:
+                observed["document"] = (uri, content)
+
+            async def request(self, method: str, params: dict[str, Any], timeout_sec: float):
+                observed["request"] = (method, params, timeout_sec)
+                return [{"title": "Add missing import"}]
+
+        async def initialize() -> None:
+            return None
+
+        manager._clients = [cast(HeadlessLSPClient, FakeClient())]
+        manager._init_clients = initialize  # type: ignore[method-assign]
+        uri = (tmp_path / "sample.py").as_uri()
+        position = {"line": 3, "character": 7}
+        diagnostics = [{"message": "Undefined name", "code": "F821"}]
+
+        result = await manager.request_semantic(
+            "textDocument/codeAction",
+            uri,
+            position,
+            document_text="current source",
+            diagnostics=diagnostics,
+        )
+
+        assert result == {"fake-lsp": [{"title": "Add missing import"}]}
+        assert observed["document"] == (uri, "current source")
+        method, params, timeout = observed["request"]
+        assert method == "textDocument/codeAction"
+        assert params["range"] == {"start": position, "end": position}
+        assert params["context"]["diagnostics"] == diagnostics
+        assert timeout > 0
+
+    @pytest.mark.asyncio
     async def test_find_executable_discovers_ruff(self) -> None:
         found = _find_executable("ruff")
         assert found is not None

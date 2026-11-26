@@ -29,6 +29,13 @@ class TestSecurityPolicy:
             == RiskLevel.MEDIUM
         )
         assert policy.evaluate_risk("run_command", {"command": "pytest -v"}) == RiskLevel.MEDIUM
+        assert (
+            policy.evaluate_risk(
+                "apply_code_action",
+                {"path": "src/app.py", "action_title": "Add import"},
+            )
+            == RiskLevel.MEDIUM
+        )
 
         # High risk destructive commands
         assert policy.evaluate_risk("run_command", {"command": "rm -rf /"}) == RiskLevel.HIGH
@@ -97,6 +104,38 @@ class TestSecurityPolicy:
         allowed_after, reason = policy.check_permission("run_command", args)
         assert allowed_after is True
         assert "pre-approved" in reason
+
+    def test_apply_code_action_reuses_existing_permission_modes(self):
+        arguments = {
+            "path": "src/app.py",
+            "line": 4,
+            "character": 2,
+            "server_name": "pyright",
+            "action_index": 0,
+            "action_title": "Add import",
+            "selection_id": "f353c4e202ad12345fa0",
+        }
+        denied, _ = SecurityPolicy().check_permission("apply_code_action", arguments)
+        assert denied is False
+
+        automatic, _ = SecurityPolicy(auto_approve=True).check_permission(
+            "apply_code_action", arguments
+        )
+        assert automatic is True
+
+        session_policy = SecurityPolicy()
+        session_policy.grant_session_permission("apply_code_action", arguments)
+        assert session_policy.check_permission("apply_code_action", arguments)[0] is True
+        assert (
+            session_policy.check_permission(
+                "apply_code_action", {**arguments, "path": "src/other.py"}
+            )[0]
+            is False
+        )
+
+        listing = {"path": "src/app.py", "line": 4, "character": 2}
+        assert SecurityPolicy().evaluate_risk("apply_code_action", listing) == RiskLevel.SAFE
+        assert SecurityPolicy().check_permission("apply_code_action", listing)[0] is True
 
 
 @pytest.mark.unit

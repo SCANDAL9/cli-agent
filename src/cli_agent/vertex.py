@@ -45,7 +45,9 @@ DEFAULT_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 def _capture_tool_edit_snapshot(name: str, arguments: dict[str, Any]) -> tuple[str, str] | None:
     """Capture a permitted text target before an interactive file edit."""
-    if name not in {"write_file", "edit_file"}:
+    if name not in {"write_file", "edit_file", "apply_code_action"}:
+        return None
+    if name == "apply_code_action" and arguments.get("action_index") is None:
         return None
     raw_path = arguments.get("path")
     if not isinstance(raw_path, str) or not raw_path:
@@ -198,6 +200,8 @@ Your Core Capabilities:
    - Use `get_symbol_outline` to inspect a file's skeleton (classes, methods, docstrings, signatures) before reading full implementations (saves ~90% tokens).
    - Use `find_symbol_definition` to jump directly to where a class, method, or function is defined across the codebase.
    - Use `find_symbol_references` to trace all callers, imports, and usages before refactoring.
+   - Use `semantic_search_code` for intent-based code queries, `get_symbol_call_tree` for bounded caller/callee paths, and `get_type_hierarchy` for base and derived classes.
+   - For `apply_code_action`, first inspect available fixes at the exact file position, then request a selected action by its server, index, title, and selection_id; only validated workspace text edits are applied.
 
 Guidelines:
 - When asked about a file or code, ALWAYS read it first with `read_file` instead of guessing.

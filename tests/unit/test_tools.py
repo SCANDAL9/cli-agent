@@ -24,6 +24,261 @@ from cli_agent.tools import (
 
 @pytest.mark.unit
 class TestToolsUnit:
+    @pytest.mark.asyncio
+    async def test_semantic_search_code_uses_hybrid_search_and_is_registered(
+        self, monkeypatch
+    ) -> None:
+        from cli_agent import search, tools
+
+        observed: dict[str, object] = {}
+
+        class FakeEngine:
+            async def search(self, query: str, limit: int) -> list[dict[str, object]]:
+                observed.update(query=query, limit=limit)
+                return [{"symbol_name": "refresh_tokens", "score": 0.9}]
+
+        monkeypatch.setattr(search, "get_hybrid_search_engine", lambda: FakeEngine())
+
+        result = await tools.semantic_search_code("token renewal", limit=3)
+
+        assert result["results"] == [{"symbol_name": "refresh_tokens", "score": 0.9}]
+        assert observed == {"query": "token renewal", "limit": 3}
+        assert tools.TOOL_REGISTRY["semantic_search_code"] is tools.semantic_search_code
+        declared = {declaration["name"] for declaration in GEMINI_TOOLS_DECLARATIONS}
+        for name in (
+            "semantic_search_code",
+            "get_symbol_call_tree",
+            "get_type_hierarchy",
+            "apply_code_action",
+        ):
+            assert name in tools.TOOL_REGISTRY
+            assert name in declared
+
+    def test_graph_intelligence_tools_dispatch_with_project_scope(self, monkeypatch) -> None:
+        from cli_agent import tools
+
+        calls: list[tuple[str, str, str, int]] = []
+
+        class FakeGraph:
+            def get_symbol_call_tree(self, project_key: str, symbol_name: str, max_depth: int):
+                calls.append(("call_tree", project_key, symbol_name, max_depth))
+                return {"symbol_name": symbol_name, "callers": [], "callees": []}
+
+            def get_type_hierarchy(self, project_key: str, symbol_name: str, max_depth: int):
+                calls.append(("hierarchy", project_key, symbol_name, max_depth))
+                return {"symbol_name": symbol_name, "bases": [], "derived": []}
+
+        monkeypatch.setattr(tools, "code_graph_store", FakeGraph())
+        monkeypatch.setattr(tools, "resolve_project_key", lambda: "test-project")
+
+        call_tree = execute_tool("get_symbol_call_tree", {"symbol_name": "refresh", "max_depth": 2})
+        hierarchy = execute_tool("get_type_hierarchy", {"symbol_name": "Base"})
+
+        assert call_tree["symbol_name"] == "refresh"
+        assert hierarchy["symbol_name"] == "Base"
+        assert calls == [
+            ("call_tree", "test-project", "refresh", 2),
+            ("hierarchy", "test-project", "Base", 3),
+        ]
+        assert "between 1 and 5" in tools.get_symbol_call_tree("refresh", max_depth=6)["error"]
+
+    def test_apply_code_action_lists_then_applies_only_the_selected_workspace_edit(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from cli_agent import lsp, tools
+
+        source = tmp_path / "sample.py"
+        original = "label = '🚀'\n"
+        source.write_text(original, encoding="utf-8")
+        uri = source.as_uri()
+        action = {
+            "title": "Add import",
+            "kind": "quickfix",
+            "edit": {
+                "changes": {
+                    uri: [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 0},
+                            },
+                            "newText": "import os\n",
+                        },
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 9},
+                                "end": {"line": 0, "character": 11},
+                            },
+                            "newText": "rocket",
+                        },
+                    ]
+                }
+            },
+        }
+        observed: list[tuple[str, str, dict[str, int], str, list[dict[str, object]]]] = []
+
+        class FakeManager:
+            workspace_root = tmp_path
+
+            def check_file_sync(self, file_path: Path, content: str, timeout_ms: float):
+                assert content == original
+                return LSPDiagnosticReport(
+                    file_path=str(file_path),
+                    uri=file_path.as_uri(),
+                    diagnostics=[
+                        LSPDiagnostic(
+                            file_path=str(file_path),
+                            line=1,
+                            column=2,
+                            end_line=1,
+                            end_column=6,
+                            severity=DiagnosticSeverity.WARNING,
+                            message="Possible unresolved name",
+                            source="fake-lsp",
+                            code="F821",
+                        )
+                    ],
+                )
+
+            def request_semantic_sync(
+                self,
+                method: str,
+                file_uri: str,
+                position: dict[str, int],
+                *,
+                document_text: str,
+                diagnostics: list[dict[str, object]],
+                timeout_sec: float,
+            ):
+                observed.append((method, file_uri, position, document_text, diagnostics))
+                return {"fake-lsp": [action]}
+
+        monkeypatch.setattr(lsp, "get_lsp_manager", lambda *_args: FakeManager())
+        with worker_execution_scope(tmp_path):
+            listed = tools.apply_code_action("sample.py", line=0, character=5)
+
+        assert listed["status"] == "available"
+        listed_action = listed["actions"][0]
+        assert {
+            key: listed_action[key] for key in ("server_name", "action_index", "title", "kind")
+        } == {
+            "server_name": "fake-lsp",
+            "action_index": 0,
+            "title": "Add import",
+            "kind": "quickfix",
+        }
+        assert len(listed_action["selection_id"]) == 20
+        assert source.read_text(encoding="utf-8") == original
+        original_new_text = action["edit"]["changes"][uri][0]["newText"]
+        action["edit"]["changes"][uri][0]["newText"] = "import sys\n"
+        with worker_execution_scope(tmp_path):
+            changed_payload = tools.apply_code_action(
+                "sample.py",
+                line=0,
+                character=5,
+                server_name="fake-lsp",
+                action_index=0,
+                action_title="Add import",
+                selection_id=listed_action["selection_id"],
+            )
+        assert "changed" in changed_payload["error"]
+        assert source.read_text(encoding="utf-8") == original
+        action["edit"]["changes"][uri][0]["newText"] = original_new_text
+        with worker_execution_scope(tmp_path):
+            stale = tools.apply_code_action(
+                "sample.py",
+                line=0,
+                character=5,
+                server_name="fake-lsp",
+                action_index=0,
+                action_title="Stale title",
+                selection_id=listed_action["selection_id"],
+            )
+        assert "changed" in stale["error"]
+        assert source.read_text(encoding="utf-8") == original
+        with worker_execution_scope(tmp_path):
+            applied = tools.apply_code_action(
+                "sample.py",
+                line=0,
+                character=5,
+                server_name="fake-lsp",
+                action_index=0,
+                action_title="Add import",
+                selection_id=listed_action["selection_id"],
+            )
+
+        assert applied["status"] == "success"
+        assert source.read_text(encoding="utf-8") == "import os\nlabel = 'rocket'\n"
+        assert len(observed) == 4
+        assert all(call[0] == "textDocument/codeAction" for call in observed)
+        assert all(call[2] == {"line": 0, "character": 5} for call in observed)
+        assert observed[0][4][0]["code"] == "F821"
+        assert observed[0][4][0]["range"]["start"] == {"line": 0, "character": 1}
+
+    def test_apply_code_action_rejects_command_only_and_external_workspace_edits(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from cli_agent import lsp, tools
+
+        source = tmp_path / "sample.py"
+        original = "value = 1\n"
+        source.write_text(original, encoding="utf-8")
+
+        actions = [
+            {"title": "Run server command", "command": "unsafe.fix"},
+            {
+                "title": "Edit another file",
+                "edit": {
+                    "changes": {
+                        (tmp_path / "other.py").as_uri(): [
+                            {
+                                "range": {
+                                    "start": {"line": 0, "character": 0},
+                                    "end": {"line": 0, "character": 0},
+                                },
+                                "newText": "unsafe = True\n",
+                            }
+                        ]
+                    }
+                },
+            },
+        ]
+        for action in actions:
+
+            class FakeManager:
+                workspace_root = tmp_path
+
+                def __init__(self, selected_actions):
+                    self.selected_actions = selected_actions
+
+                def check_file_sync(self, file_path: Path, content: str, timeout_ms: float):
+                    return LSPDiagnosticReport(
+                        file_path=str(file_path), uri=file_path.as_uri(), diagnostics=[]
+                    )
+
+                def request_semantic_sync(self, *_args, **_kwargs):
+                    return {"fake-lsp": self.selected_actions}
+
+            monkeypatch.setattr(
+                lsp,
+                "get_lsp_manager",
+                lambda *_args, selected_action=action: FakeManager([selected_action]),
+            )
+            with worker_execution_scope(tmp_path):
+                listing = tools.apply_code_action("sample.py", line=0, character=0)
+                result = tools.apply_code_action(
+                    "sample.py",
+                    line=0,
+                    character=0,
+                    server_name="fake-lsp",
+                    action_index=0,
+                    action_title=action["title"],
+                    selection_id=listing["actions"][0]["selection_id"],
+                )
+
+            assert "no source was changed" in result["error"].lower()
+            assert source.read_text(encoding="utf-8") == original
+
     def test_write_and_read_file(self, tmp_path: Path):
         file_path = tmp_path / "subdir" / "test.txt"
         content = "Line 1\nLine 2\nLine 3\n"
@@ -161,9 +416,7 @@ class TestToolsUnit:
         assert res.get("total_matches") == 1
         assert any("VertexClient" in m for m in res.get("matches", []))
 
-    def test_search_code_prefers_native_result_when_available(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_search_code_prefers_native_result_when_available(self, monkeypatch, tmp_path: Path):
         expected = {"pattern": "needle", "total_matches": 1, "matches": ["a.py:1: needle"]}
         observed = {}
 
@@ -193,9 +446,7 @@ class TestToolsUnit:
         assert result["total_matches"] == 1
         assert result["matches"] == ["fallback.py:1: Needle in fallback"]
 
-    def test_list_directory_prefers_native_result_when_available(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_list_directory_prefers_native_result_when_available(self, monkeypatch, tmp_path: Path):
         expected = {"path": str(tmp_path), "tree": "📄 native.txt"}
         observed = {}
 
@@ -225,9 +476,7 @@ class TestToolsUnit:
         observed = {}
 
         def preview(pattern, replacement, language, path="."):
-            observed.update(
-                pattern=pattern, replacement=replacement, language=language, path=path
-            )
+            observed.update(pattern=pattern, replacement=replacement, language=language, path=path)
             return expected
 
         monkeypatch.setattr(fast_tools, "ast_grep_replace", preview)
@@ -420,7 +669,10 @@ class TestToolsUnit:
         # 1. Start background process with unbuffered output (-u)
         start_res = execute_tool(
             "start_background_process",
-            {"command": "python3 -u -c 'import time; print(\"server_started\", flush=True); time.sleep(10)'", "cwd": str(tmp_path)},
+            {
+                "command": "python3 -u -c 'import time; print(\"server_started\", flush=True); time.sleep(10)'",
+                "cwd": str(tmp_path),
+            },
         )
         assert start_res.get("status") == "started"
         job_id = start_res["job_id"]
@@ -428,6 +680,7 @@ class TestToolsUnit:
 
         # 2. Check running process
         import time
+
         time.sleep(0.4)
         check_res = execute_tool("check_background_process", {"job_id": job_id})
         assert check_res.get("job_id") == job_id
@@ -465,4 +718,3 @@ class TestToolsUnit:
             assert "Access denied" in blocked_edit.get("error", "")
         finally:
             reset_allowed_write_paths(token)
-

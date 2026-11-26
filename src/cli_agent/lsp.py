@@ -296,10 +296,21 @@ class HeadlessLSPClient:
             },
         )
 
-    async def request_code_actions(self, uri: str, range_: dict[str, Any]) -> Any | None:
+    async def request_code_actions(
+        self,
+        uri: str,
+        range_: dict[str, Any],
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.01,
+    ) -> Any | None:
         return await self.request(
             "textDocument/codeAction",
-            {"textDocument": {"uri": uri}, "range": range_, "context": {"diagnostics": []}},
+            {
+                "textDocument": {"uri": uri},
+                "range": range_,
+                "context": {"diagnostics": diagnostics or []},
+            },
+            timeout_sec=timeout_sec,
         )
 
     async def _stdout_reader_loop(self) -> None:
@@ -656,9 +667,16 @@ class HeadlessLSPManager:
                 self._clients.append(client)
 
     async def request_semantic(
-        self, method: str, uri: str, position: dict[str, int] | None = None
+        self,
+        method: str,
+        uri: str,
+        position: dict[str, int] | None = None,
+        *,
+        document_text: str | None = None,
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.01,
     ) -> dict[str, Any]:
-        """Query every active language server for a definition, references, or code action."""
+        """Query active language servers for semantic requests at an explicit position."""
         await self._init_clients()
         params: dict[str, Any] = {"textDocument": {"uri": uri}}
         if method in {"textDocument/definition", "textDocument/references"}:
@@ -668,20 +686,27 @@ class HeadlessLSPManager:
             if method == "textDocument/references":
                 params["context"] = {"includeDeclaration": True}
         elif method == "textDocument/codeAction":
+            if position is None:
+                return {}
             params.update(
                 {
                     "range": {
-                        "start": position or {"line": 0, "character": 0},
-                        "end": position or {"line": 0, "character": 0},
+                        "start": position,
+                        "end": position,
                     },
-                    "context": {"diagnostics": []},
+                    "context": {"diagnostics": diagnostics or []},
                 }
             )
         else:
             return {}
         ready_clients = [client for client in self._clients if client.is_ready]
+        if method == "textDocument/codeAction" and document_text is not None:
+            await asyncio.gather(
+                *(client.notify_document(uri, document_text) for client in ready_clients),
+                return_exceptions=True,
+            )
         results = await asyncio.gather(
-            *(client.request(method, params, timeout_sec=0.01) for client in ready_clients),
+            *(client.request(method, params, timeout_sec=timeout_sec) for client in ready_clients),
             return_exceptions=True,
         )
         return {
@@ -689,6 +714,37 @@ class HeadlessLSPManager:
             for client, result in zip(ready_clients, results, strict=False)
             if result is not None and not isinstance(result, BaseException)
         }
+
+    def request_semantic_sync(
+        self,
+        method: str,
+        uri: str,
+        position: dict[str, int] | None = None,
+        *,
+        document_text: str | None = None,
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.05,
+    ) -> dict[str, Any]:
+        """Runs semantic requests on the manager's LSP event loop for sync tools."""
+        self._ensure_loop_started()
+        if self._loop is None or not self._loop.is_running():
+            return {}
+        request = asyncio.run_coroutine_threadsafe(
+            self.request_semantic(
+                method,
+                uri,
+                position,
+                document_text=document_text,
+                diagnostics=diagnostics,
+                timeout_sec=timeout_sec,
+            ),
+            self._loop,
+        )
+        try:
+            return request.result(timeout=timeout_sec + 0.1)
+        except Exception:
+            request.cancel()
+            return {}
 
     @property
     def active_server_names(self) -> list[str]:
