@@ -3,6 +3,8 @@
 
 Run from the repository root with:
     PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py
+    PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py --edge-density dense
+    PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py --edge-density dense --source-index off
 
 All databases and generated source files live in a temporary directory. The
 probe uses identical workloads per backend and reports candidate/source hashes
@@ -11,6 +13,7 @@ so measurements can be tied to the exact code that was tested.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -35,9 +38,19 @@ CREATES_PER_TRIAL = 20
 TRIALS = 3
 
 
-def _source(file_number: int, call_target: int | None = None) -> str:
+def _source(
+    file_number: int,
+    call_target: int | None = None,
+    *,
+    dense: bool,
+) -> str:
     lines = [
-        f"def function_{file_number}_{index}(): return {index}" for index in range(SYMBOLS_PER_FILE)
+        (
+            f"def function_{file_number}_{index}(): return helper_0()"
+            if dense
+            else f"def function_{file_number}_{index}(): return {index}"
+        )
+        for index in range(SYMBOLS_PER_FILE)
     ]
     if call_target is not None:
         lines[0] = f"def function_{file_number}_0(): return helper_{call_target}()"
@@ -102,20 +115,31 @@ def _counts(store: CodeGraphStore) -> tuple[int, int]:
     return symbols["count"], edges["count"]
 
 
-def _run_trial(root: Path, backend: str, trial: int) -> dict[str, Any]:
+def _run_trial(
+    root: Path,
+    backend: str,
+    trial: int,
+    *,
+    edge_density: str,
+    source_index: str,
+) -> dict[str, Any]:
     trial_root = root / backend / f"trial_{trial}"
     source_root = trial_root / "project"
     source_root.mkdir(parents=True)
     initial_paths = [source_root / f"file_{index:04}.py" for index in range(INITIAL_FILES)]
     for index, path in enumerate(initial_paths):
-        path.write_text(_source(index), encoding="utf-8")
+        path.write_text(_source(index, dense=edge_density == "dense"), encoding="utf-8")
 
     database_path = trial_root / "graph.db"
     engine = TursoLocalEngine(database_path) if backend == "turso" else SQLiteEngine(database_path)
     store = CodeGraphStore(database_path, storage_engine=engine)
     indexer = CodeGraphIndexer(store)
+    if source_index == "off":
+        with store._get_connection() as connection:
+            connection.execute("DROP INDEX IF EXISTS idx_edges_source")
     indexer.index_files(initial_paths, PROJECT_KEY)
-    assert _counts(store) == (25_000, 0)
+    initial_edges = 25_000 if edge_density == "dense" else 0
+    assert _counts(store) == (25_000, initial_edges)
 
     parse_ms: list[float] = []
     persistence_ms: list[float] = []
@@ -149,7 +173,14 @@ def _run_trial(root: Path, backend: str, trial: int) -> dict[str, Any]:
 
     for index in range(MODIFICATIONS_PER_TRIAL):
         file_path = source_root / f"file_{index:04}.py"
-        file_path.write_text(_source(index, call_target=trial * 1_000 + index), encoding="utf-8")
+        file_path.write_text(
+            _source(
+                index,
+                call_target=trial * 1_000 + index,
+                dense=edge_density == "dense",
+            ),
+            encoding="utf-8",
+        )
         start = time.perf_counter()
         indexer.index_file(file_path, PROJECT_KEY)
         event_ms["modify"].append((time.perf_counter() - start) * 1000)
@@ -166,10 +197,13 @@ def _run_trial(root: Path, backend: str, trial: int) -> dict[str, Any]:
         event_ms["create"].append((time.perf_counter() - start) * 1000)
 
     final_counts = _counts(store)
-    assert final_counts == (25_020, 60), final_counts
+    added_edges = CREATES_PER_TRIAL + (0 if edge_density == "dense" else MODIFICATIONS_PER_TRIAL)
+    assert final_counts == (25_020, initial_edges + added_edges), final_counts
     engine.close()
     return {
         "trial": trial,
+        "edge_density": edge_density,
+        "source_index": source_index,
         "events": {kind: _summary(values) for kind, values in event_ms.items()},
         "stages": {
             "parse_read": _summary(parse_ms),
@@ -183,8 +217,23 @@ def _run_trial(root: Path, backend: str, trial: int) -> dict[str, Any]:
     }
 
 
-def _run_backend(root: Path, backend: str) -> dict[str, Any]:
-    trials = [_run_trial(root, backend, trial) for trial in range(1, TRIALS + 1)]
+def _run_backend(
+    root: Path,
+    backend: str,
+    *,
+    edge_density: str,
+    source_index: str,
+) -> dict[str, Any]:
+    trials = [
+        _run_trial(
+            root,
+            backend,
+            trial,
+            edge_density=edge_density,
+            source_index=source_index,
+        )
+        for trial in range(1, TRIALS + 1)
+    ]
     aggregate = {
         "events": {
             kind: _summary([sample for trial in trials for sample in trial["_samples"][kind]])
@@ -201,16 +250,41 @@ def _run_backend(root: Path, backend: str) -> dict[str, Any]:
         del trial["_samples"]
         del trial["_parse_ms"]
         del trial["_persistence_ms"]
-    return {"backend": backend, "aggregate": aggregate, "trials": trials}
+    return {
+        "backend": backend,
+        "edge_density": edge_density,
+        "source_index": source_index,
+        "aggregate": aggregate,
+        "trials": trials,
+    }
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--edge-density", choices=("sparse", "dense"), default="sparse")
+    parser.add_argument(
+        "--source-index",
+        choices=("on", "off"),
+        default="on",
+        help="disable the source-edge index for an A/B comparison",
+    )
+    args = parser.parse_args()
     repository_root = Path(__file__).resolve().parents[1]
     candidate = _candidate_identity(repository_root)
     with tempfile.TemporaryDirectory(prefix="cli-agent-code-graph-benchmark-") as temp:
         results = [
-            _run_backend(Path(temp), "turso"),
-            _run_backend(Path(temp), "sqlite"),
+            _run_backend(
+                Path(temp),
+                "turso",
+                edge_density=args.edge_density,
+                source_index=args.source_index,
+            ),
+            _run_backend(
+                Path(temp),
+                "sqlite",
+                edge_density=args.edge_density,
+                source_index=args.source_index,
+            ),
         ]
     print(
         json.dumps(
@@ -225,11 +299,15 @@ def main() -> None:
                     "initial_files": INITIAL_FILES,
                     "symbols_per_file": SYMBOLS_PER_FILE,
                     "initial_symbols": 25_000,
-                    "initial_edges": 0,
+                    "initial_edges": 25_000 if args.edge_density == "dense" else 0,
+                    "edge_density": args.edge_density,
+                    "source_index": args.source_index,
                     "modifications_per_trial": MODIFICATIONS_PER_TRIAL,
                     "creates_per_trial": CREATES_PER_TRIAL,
                     "expected_final_symbols_per_trial": 25_020,
-                    "expected_final_edges_per_trial": 60,
+                    "expected_final_edges_per_trial": (
+                        25_020 if args.edge_density == "dense" else 60
+                    ),
                     "percentile_method": "nearest-rank",
                 },
                 "results": results,

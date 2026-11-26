@@ -37,6 +37,31 @@ def temp_indexer(temp_graph_store: CodeGraphStore) -> CodeGraphIndexer:
 
 @pytest.mark.unit
 class TestCodeGraphStore:
+    def test_schema_indexes_edges_by_source_symbol(self, tmp_path: Path) -> None:
+        backends = (
+            ("turso", TursoLocalEngine),
+            ("sqlite", SQLiteEngine),
+        )
+        for name, engine_factory in backends:
+            database_path = tmp_path / f"{name}.db"
+            engine = engine_factory(database_path)
+            store = CodeGraphStore(database_path, storage_engine=engine)
+            try:
+                with store._get_connection() as connection:
+                    connection.execute("DROP INDEX IF EXISTS idx_edges_source")
+            finally:
+                engine.close()
+
+            engine = engine_factory(database_path)
+            store = CodeGraphStore(database_path, storage_engine=engine)
+            try:
+                with store._get_connection() as connection:
+                    indexes = connection.execute("PRAGMA index_list(symbol_edges)").fetchall()
+
+                assert "idx_edges_source" in {index["name"] for index in indexes}
+            finally:
+                engine.close()
+
     def test_call_tree_traces_callers_and_callees_without_cycles(
         self, temp_graph_store: CodeGraphStore
     ) -> None:

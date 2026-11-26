@@ -135,6 +135,9 @@ class CodeGraphStore:
                 "CREATE INDEX IF NOT EXISTS idx_edges_lookup ON symbol_edges(target_symbol_name);"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edges_source ON symbol_edges(source_symbol_id);"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS file_metadata (
                     project_key TEXT NOT NULL,
