@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from cli_agent.embeddings import FastEmbedEmbeddingProvider
 from cli_agent.search import (
     CodeChunker,
     FastLocalEmbeddingProvider,
@@ -140,6 +141,47 @@ def helper_function(x: int) -> int:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestHybridSearchEngine:
+    async def test_default_provider_is_local_fastembed_without_loading_model(
+        self, tmp_path: Path
+    ) -> None:
+        engine = HybridSearchEngine(db_path=tmp_path / "default.db")
+        assert isinstance(engine.embedding_provider, FastEmbedEmbeddingProvider)
+        assert engine.embedding_provider._model is None
+
+    async def test_legacy_vector_dimensions_do_not_create_false_dense_hits(
+        self, tmp_path: Path
+    ) -> None:
+        class TwoDimensionalProvider:
+            async def embed_query(self, text: str) -> list[float]:
+                return [1.0, 0.0]
+
+            async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                return [[1.0, 0.0] for _ in texts]
+
+        engine = HybridSearchEngine(
+            db_path=tmp_path / "legacy.db", embedding_provider=TwoDimensionalProvider()
+        )
+        with engine._get_connection() as conn:
+            conn.execute(
+                """INSERT INTO code_chunks (
+                       project_key, file_path, symbol_name, symbol_type,
+                       start_line, end_line, content, embedding
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "legacy",
+                    "legacy.py",
+                    "legacy_symbol",
+                    "function",
+                    1,
+                    1,
+                    "legacy text",
+                    "[1,0,0]",
+                ),
+            )
+            conn.commit()
+
+        assert await engine.search("unmatched intent", project_key="legacy") == []
+
     async def test_indexing_and_hybrid_search(self, tmp_path: Path) -> None:
         db_path = tmp_path / "search_test.db"
         engine = HybridSearchEngine(db_path=db_path)

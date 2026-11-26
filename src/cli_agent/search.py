@@ -16,6 +16,7 @@ from typing import Any
 
 from .code_graph import EXCLUDED_DIRS, PY_LANGUAGE, SUPPORTED_EXTENSIONS, CodeGraphIndexer
 from .config import StorageConfig
+from .embeddings import FastEmbedEmbeddingProvider
 from .memory import DEFAULT_DB_PATH, resolve_project_key
 from .storage import StorageConnection, StorageEngine, resolve_store_engine
 from .token_provider import TokenProvider
@@ -365,7 +366,7 @@ class HybridSearchEngine:
             DEFAULT_DB_PATH, db_path, storage_engine, storage_config
         )
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
-        self.embedding_provider = embedding_provider or FastLocalEmbeddingProvider()
+        self.embedding_provider = embedding_provider or FastEmbedEmbeddingProvider()
         self._vector_cache: dict[str, list[tuple[int, list[float]]]] = {}
         self._init_db()
 
@@ -517,6 +518,8 @@ class HybridSearchEngine:
                 if emb_raw:
                     try:
                         emb = json.loads(emb_raw)
+                        if len(query_vec) != len(emb):
+                            continue
                         sim = cosine_similarity(query_vec, emb)
                         vector_scores.append((c_id, sim))
                     except Exception:

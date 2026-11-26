@@ -34,7 +34,9 @@ An autonomous AI developer agent running directly on developer workstations via 
 - **Hot-Togglable Autonomous Mode:** Toggle permission gates on the fly with `/auto` or select `[y] Yes / [n] No / [a] Always` per tool call.
 - **Surgical File Operations:** In-place atomic string replacements (`edit_file`) without rewriting entire files.
 - **Tree-sitter Code Intelligence:** Structural AST indexing, outline extraction, symbol definition lookup, references tracing, and impact analysis.
-- **Hybrid Code Search:** Combines BM25 keyword matching (FTS5) with dense vector embeddings via Reciprocal Rank Fusion (RRF).
+- **Hybrid Code Search:** Combines BM25 keyword matching (FTS5) with local FastEmbed vectors via Reciprocal Rank Fusion (RRF). Search never calls a hosted embedding API. It uses `BAAI/bge-small-en-v1.5` when that model is already cached; otherwise it remains available through FTS5 until the model is provisioned.
+
+FastEmbed model weights are not downloaded by normal CLI searches. To provision the default model once on a machine, run `python -c 'from fastembed import TextEmbedding; from pathlib import Path; TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=str(Path.home() / ".cache" / "fastembed"))'` while network access to Hugging Face is allowed. Subsequent search uses FastEmbed's local-only mode and does not contact model or API hosts.
 - **Ephemeral Git Sandboxes:** Isolate experimental code mutations in throwaway Git worktrees with atomic diff reviews before merging.
 - **Autonomous Multi-Agent Swarm (ODD):** Decompose complex goals into isolated Feature Worker and QA Verifier subagents.
 - **Self-Healing TDD Loop:** Automatic Red-Green-Refactor test repair loop with regression detection.
