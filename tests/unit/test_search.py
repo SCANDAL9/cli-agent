@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from cli_agent.config import StorageConfig
 from cli_agent.embeddings import FastEmbedEmbeddingProvider
 from cli_agent.search import (
     CodeChunker,
@@ -141,6 +142,28 @@ def helper_function(x: int) -> int:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestHybridSearchEngine:
+    async def test_explicit_sqlite_runtime_keeps_fts5_search(self, tmp_path: Path) -> None:
+        class StaticProvider:
+            async def embed_query(self, text: str) -> list[float]:
+                return [1.0, 0.0]
+
+            async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                return [[1.0, 0.0] for _ in texts]
+
+        engine = HybridSearchEngine(
+            db_path=tmp_path / "sqlite.db",
+            embedding_provider=StaticProvider(),
+            storage_config=StorageConfig(backend="sqlite"),
+        )
+        source = tmp_path / "legacy_search.py"
+        source.write_text("def compatibility_keyword():\n    return True\n", encoding="utf-8")
+        await engine.index_file(source, project_key="legacy")
+
+        results = await engine.search("compatibility_keyword", project_key="legacy")
+
+        assert results
+        assert results[0]["symbol_name"] == "compatibility_keyword"
+
     async def test_default_provider_is_local_fastembed_without_loading_model(
         self, tmp_path: Path
     ) -> None:

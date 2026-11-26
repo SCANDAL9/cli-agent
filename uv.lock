@@ -233,6 +233,7 @@ dependencies = [
     { name = "fastembed" },
     { name = "httpx" },
     { name = "prompt-toolkit" },
+    { name = "pyturso" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "tree-sitter" },
@@ -260,6 +261,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "libsql", marker = "extra == 'turso'", specifier = ">=0.1.11" },
     { name = "prompt-toolkit", specifier = ">=3.0.40" },
+    { name = "pyturso", specifier = ">=0.8.4" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "tree-sitter", specifier = ">=0.26.0" },
@@ -1234,6 +1236,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/4e/42/f53c58570e80d503ade9dd42ce57f2915d14bcbe25f6308138143950d1d6/pytest_httpx-0.36.2.tar.gz", hash = "sha256:05a56527484f7f4e8c856419ea379b8dc359c36801c4992fdb330f294c690356", size = 57683, upload-time = "2026-04-09T13:57:19.837Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/55/1fa65f8e4fceb19dd6daa867c162ad845d547f6058cd92b4b02384a44777/pytest_httpx-0.36.2-py3-none-any.whl", hash = "sha256:d42ebd5679442dc7bfb0c48e0767b6562e9bc4534d805127b0084171886a5e22", size = 20315, upload-time = "2026-04-09T13:57:18.587Z" },
+]
+
+[[package]]
+name = "pyturso"
+version = "0.8.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/14/fb/6e3ca35279c8e20a323af7712d11bbd602ebea324ed5ec034bde381be38c/pyturso-0.8.4.tar.gz", hash = "sha256:eb0844f6b22113912e1f74cc6614bda5906a256ab2050830c226d536e79ab6ab", size = 3326652, upload-time = "2026-11-20T09:22:17.635Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2e/dc/7a60e3660541363134e440739b3f0dbf10203e06f196079854d4ed5633ee/pyturso-0.8.4-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:3edf4e0a8cb367ce59b2854b2a31cb9e593e35819f5783342d6832f2807b7b75", size = 9420086, upload-time = "2026-11-20T09:22:09.424Z" },
+    { url = "https://files.pythonhosted.org/packages/67/57/fc78684370597016827a2b59d5f9dfbf492421139573af3b8e5245537e62/pyturso-0.8.4-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:e36d29e52528d3cde99aab13d6f25132d1025d75d144a72096b3dd8476c59fd2", size = 8252383, upload-time = "2026-11-20T09:22:11.577Z" },
+    { url = "https://files.pythonhosted.org/packages/20/68/481849eaf7b3deed493776a8e4d5eecdeb7db8b5576d2da165b177e3c6f7/pyturso-0.8.4-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:91c84f0d7152aaaef38276ef5529a71d22e8770aa414f84e0318c6e64b27066d", size = 27664791, upload-time = "2026-11-20T09:22:13.232Z" },
+    { url = "https://files.pythonhosted.org/packages/79/af/b083137b8b07d307abe8a8f79595f6e6559d8cbbbc0c3a573a50508562c2/pyturso-0.8.4-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a4aca3cca9b83696ba850db2be4e081809d58f59bf2ac99e7926a684455869a6", size = 28123311, upload-time = "2026-11-20T09:22:15.684Z" },
 ]
 
 [[package]]

@@ -122,7 +122,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "/sessions": "List persistent conversation sessions",
     "/session": "Show active session details and turn count",
     "/resume": "Resume a previous conversation session",
-    "/memories": "List persistent SQLite knowledge memories",
+    "/memories": "List persistent knowledge memories",
     "/compact": "Compact conversation history context",
     "/doctor": "Verify authentication, DB, AST, native accelerators, and health",
     "/setup": "Launch GCP project onboarding wizard",
@@ -563,7 +563,7 @@ def print_banner(
     theme_badge = f" [dim]•[/dim] [{c_secondary}]Matugen[/{c_secondary}]" if p.is_matugen else ""
     banner_text = (
         f"[bold {c_primary}]kanon[/bold {c_primary}] [dim]•[/dim] [bold {c_accent}]{model_name}[/bold {c_accent}] [dim]•[/dim] "
-        f"[{c_secondary}]SQLite Memory ({memory_count} memories)[/{c_secondary}] [dim]•[/dim] [{c_primary}]AST Code Graph[/{c_primary}]{theme_badge}\n"
+        f"[{c_secondary}]Turso Memory ({memory_count} memories)[/{c_secondary}] [dim]•[/dim] [{c_primary}]AST Code Graph[/{c_primary}]{theme_badge}\n"
         f"[dim]Workspace:[/dim] [bold white]~/{ws_name}[/bold white] [dim]•[/dim] [dim]{session_badge}[/dim]\n"
         f"[dim]Shortcuts:[/dim] [bold {c_primary}]![/bold {c_primary}] [dim]shell[/dim]   "
         f"[bold {c_primary}]/[/bold {c_primary}] [dim]commands[/dim]   "
@@ -1820,7 +1820,7 @@ async def _run_interactive_session(
             active_session_id = generate_session_id()
             console.print(
                 "[dim cyan]Conversation history cleared. Started fresh session: "
-                f"[bold yellow]{active_session_id}[/bold yellow] (SQLite memories preserved).[/dim cyan]"
+                f"[bold yellow]{active_session_id}[/bold yellow] (persistent memories preserved).[/dim cyan]"
             )
             continue
 
@@ -2418,7 +2418,7 @@ async def _run_interactive_session(
             )
             table.add_row("OAuth2 Token", tok_str, "")
             table.add_row("Target Project", "[cyan]Configured[/cyan]", client.project_id)
-            table.add_row("SQLite Database", db_str, diag["database_path"])
+            table.add_row("Turso Database", db_str, diag["database_path"])
             table.add_row(
                 "AST Code Graph",
                 cg_str,
@@ -2472,7 +2472,7 @@ async def _run_interactive_session(
             table.add_row(
                 "Hybrid Code Search",
                 "[green]Ready[/green]",
-                "FTS5 BM25 + Dense Vectors + Reciprocal Rank Fusion",
+                "Turso FTS + Dense Vectors + Reciprocal Rank Fusion",
             )
             table.add_row(
                 "Git Host Platform",

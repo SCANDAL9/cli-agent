@@ -9,14 +9,29 @@ from ..config import StorageConfig, load_storage_config
 from .base import StorageEngine
 from .migration import migrate_legacy_database
 from .sqlite import SQLiteEngine
-from .turso import TursoEngine
+from .turso import TursoEngine, TursoLocalEngine
+
+
+def _turso_database_path(legacy_path: Path, config: StorageConfig) -> Path:
+    if config.replica_path is not None:
+        return config.replica_path
+    suffix = legacy_path.suffix or ".db"
+    return legacy_path.with_name(f"{legacy_path.stem}.turso{suffix}")
+
+
+def _migrate_or_close(legacy_path: Path, engine: StorageEngine) -> None:
+    try:
+        migrate_legacy_database(legacy_path, engine)
+    except BaseException:
+        engine.close()
+        raise
 
 
 def create_storage_engine(
     database_path: Path | str,
     config: StorageConfig,
 ) -> StorageEngine:
-    """Builds the configured backend, migrating the legacy DB only for Turso."""
+    """Builds the configured backend, importing the legacy SQLite DB into Turso."""
     legacy_path = Path(database_path).expanduser()
     has_url = bool(config.turso_database_url)
     has_token = bool(config.turso_auth_token)
@@ -25,11 +40,20 @@ def create_storage_engine(
     if backend == "auto":
         if has_url != has_token:
             raise ValueError("auto storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN")
-        backend = "turso" if has_url and has_token else "sqlite"
+        backend = "turso"
     if backend == "sqlite":
         return SQLiteEngine(legacy_path)
     if backend != "turso":
         raise ValueError("Storage backend must be 'auto', 'sqlite', or 'turso'.")
+    if not has_url and not has_token:
+        if config.turso_mode == "remote":
+            raise ValueError(
+                "remote Turso storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN"
+            )
+        engine = TursoLocalEngine(_turso_database_path(legacy_path, config))
+        if legacy_path.resolve() != engine.local_database_path.resolve():
+            _migrate_or_close(legacy_path, engine)
+        return engine
     if not has_url or not has_token:
         raise ValueError("turso storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN")
 
@@ -42,7 +66,7 @@ def create_storage_engine(
             mode="remote",
         )
     else:
-        replica_path = config.replica_path or legacy_path.with_name("turso-replica.db")
+        replica_path = _turso_database_path(legacy_path, config)
         engine = TursoEngine(
             replica_path,
             remote_url=str(config.turso_database_url),
@@ -51,7 +75,7 @@ def create_storage_engine(
         )
     local_path = engine.local_database_path
     if local_path is None or legacy_path.resolve() != local_path.resolve():
-        migrate_legacy_database(legacy_path, engine)
+        _migrate_or_close(legacy_path, engine)
     return engine
 
 
@@ -84,8 +108,6 @@ def resolve_store_engine(
     path = Path(database_path).expanduser() if database_path is not None else default_database_path
     if storage_config is not None:
         settings = storage_config
-    elif database_path is not None:
-        settings = StorageConfig(backend="sqlite")
     else:
         settings = load_storage_config()
     return get_storage_engine(path, settings)

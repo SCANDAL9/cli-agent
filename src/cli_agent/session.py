@@ -1,6 +1,6 @@
 """
 Session persistence and resumption engine for cli-agent.
-Stores full turn-by-turn conversation histories in SQLite, enabling users
+Stores full turn-by-turn conversation histories in persistent storage, enabling users
 to list past sessions and seamlessly resume or continue them via CLI flags or REPL commands.
 """
 
@@ -79,7 +79,7 @@ def derive_session_title(
 
 class SessionStore:
     """
-    SQLite-backed repository for multi-turn conversational session states.
+    StorageEngine-backed repository for multi-turn conversational session states.
     Allows listing, updating, querying, and resuming sessions across process restarts.
     """
 
@@ -133,7 +133,7 @@ class SessionStore:
         title: str | None = None,
     ) -> SessionRecord:
         """
-        Saves or updates a conversation session in SQLite.
+        Saves or updates a conversation session in the configured storage engine.
         """
         resolved_key = str(project_key or resolve_project_key())
         final_title = str(title or derive_session_title(messages))

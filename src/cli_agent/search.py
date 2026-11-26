@@ -1,6 +1,6 @@
 """
 Hybrid Code Search Engine for cli-agent.
-Combines sparse keyword search (SQLite FTS5 BM25) with dense vector embeddings
+Combines sparse full-text search with dense vector embeddings
 via AST-aware code chunking and Reciprocal Rank Fusion (RRF).
 """
 
@@ -53,9 +53,8 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
 
 def sanitize_fts5_query(query: str) -> str:
     """
-    Sanitizes an arbitrary user search query into safe SQLite FTS5 quoted tokens.
-    Strips special syntax characters (e.g., '-', ':', '\"', '(', ')', '*') and wraps
-    clean alphanumeric/underscore tokens in double quotes to prevent FTS5 syntax crashes.
+    Sanitizes a user query into safe quoted tokens accepted by both FTS5 and Turso FTS.
+    Strips special syntax characters and retains alphanumeric/underscore tokens.
     """
     # Replace FTS5 operator/syntax characters with spaces and extract alphanumeric tokens
     cleaned = re.sub(r'[-:"()*^~+<>!?/\\|[\]{}@#$%&=,;.\'`]+', " ", query)
@@ -350,7 +349,7 @@ class CodeChunker:
 
 class HybridSearchEngine:
     """
-    Coordinates AST chunk indexing, SQLite FTS5 BM25 queries, in-memory cached dense vector scoring,
+    Coordinates AST chunk indexing, full-text relevance queries, in-memory cached dense vector scoring,
     and Reciprocal Rank Fusion (RRF).
     """
 
@@ -392,18 +391,27 @@ class HybridSearchEngine:
                 );
                 """
             )
-            cursor.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
-                    content,
-                    symbol_name,
-                    file_path,
-                    content='code_chunks',
-                    content_rowid='id'
-                );
-                """
-            )
+            if self.storage_engine.fts_dialect != "turso":
+                cursor.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
+                        content,
+                        symbol_name,
+                        file_path,
+                        content='code_chunks',
+                        content_rowid='id'
+                    );
+                    """
+                )
             conn.commit()
+
+        if self.storage_engine.fts_dialect == "turso":
+            self.storage_engine.create_fts_table(
+                "code_chunks_fts",
+                ("content", "symbol_name", "file_path"),
+                content_table="code_chunks",
+                content_rowid="id",
+            )
 
     async def index_file(self, file_path: Path, project_key: str) -> int:
         """Chunks and indexes a single file."""
@@ -424,10 +432,11 @@ class HybridSearchEngine:
                 "DELETE FROM code_chunks WHERE project_key = ? AND file_path = ?",
                 (project_key, str(file_path)),
             )
-            cursor.execute(
-                "DELETE FROM code_chunks_fts WHERE file_path = ?",
-                (str(file_path),),
-            )
+            if self.storage_engine.fts_dialect != "turso":
+                cursor.execute(
+                    "DELETE FROM code_chunks_fts WHERE file_path = ?",
+                    (str(file_path),),
+                )
 
             for chunk in chunks:
                 cursor.execute(
@@ -448,14 +457,15 @@ class HybridSearchEngine:
                         json.dumps(chunk.embedding) if chunk.embedding else None,
                     ),
                 )
-                chunk_id = cursor.lastrowid
-                cursor.execute(
-                    """
-                    INSERT INTO code_chunks_fts (rowid, content, symbol_name, file_path)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (chunk_id, chunk.content, chunk.symbol_name, chunk.file_path),
-                )
+                if self.storage_engine.fts_dialect != "turso":
+                    chunk_id = cursor.lastrowid
+                    cursor.execute(
+                        """
+                        INSERT INTO code_chunks_fts (rowid, content, symbol_name, file_path)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (chunk_id, chunk.content, chunk.symbol_name, chunk.file_path),
+                    )
             conn.commit()
 
         return len(chunks)
@@ -482,25 +492,40 @@ class HybridSearchEngine:
         """
         pk = project_key or resolve_project_key()
 
-        # 1. Sparse Retrieval via SQLite FTS5 (BM25 ranking)
+        # 1. Sparse retrieval via the active engine's full-text index
         bm25_ids: list[int] = []
         fts_query = sanitize_fts5_query(query)
         if fts_query:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 try:
-                    cursor.execute(
-                        """
-                        SELECT rowid FROM code_chunks_fts
-                        WHERE code_chunks_fts MATCH ?
-                        ORDER BY rank
-                        LIMIT 50
-                        """,
-                        (fts_query,),
-                    )
+                    if self.storage_engine.fts_dialect == "turso":
+                        cursor.execute(
+                            """
+                            WITH matched AS (
+                                SELECT id, fts_score(content, symbol_name, file_path, ?) AS score
+                                FROM code_chunks
+                                WHERE fts_match(content, symbol_name, file_path, ?)
+                            )
+                            SELECT id FROM matched
+                            ORDER BY score DESC
+                            LIMIT 50
+                            """,
+                            (fts_query, fts_query),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            SELECT rowid FROM code_chunks_fts
+                            WHERE code_chunks_fts MATCH ?
+                            ORDER BY rank
+                            LIMIT 50
+                            """,
+                            (fts_query,),
+                        )
                     bm25_ids = [row[0] for row in cursor.fetchall()]
                 except Exception as e:
-                    logger.debug(f"FTS5 match failed: {e}")
+                    logger.debug(f"Full-text match failed: {e}")
 
         # 2. Dense Vector Retrieval
         query_vec = await self.embedding_provider.embed_query(query)

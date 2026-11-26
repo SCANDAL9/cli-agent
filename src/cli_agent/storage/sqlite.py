@@ -11,6 +11,9 @@ from .base import StorageConnection, quote_identifier
 
 
 class SQLiteEngine:
+    fts_dialect = "fts5"
+    migration_transaction_sql = "BEGIN IMMEDIATE"
+
     def __init__(self, database_path: Path | str, busy_timeout_ms: int = 30_000) -> None:
         self.database_path = Path(database_path).expanduser()
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
@@ -56,13 +59,28 @@ class SQLiteEngine:
         content_table: str | None = None,
         content_rowid: str | None = None,
     ) -> None:
-        statement = self._fts_statement(
+        statement = self.fts_table_statement(
             table_name,
             columns,
             content_table=content_table,
             content_rowid=content_rowid,
         )
         self.execute(statement)
+
+    def fts_table_statement(
+        self,
+        table_name: str,
+        columns: Sequence[str],
+        *,
+        content_table: str | None = None,
+        content_rowid: str | None = None,
+    ) -> str:
+        return self._fts_statement(
+            table_name,
+            columns,
+            content_table=content_table,
+            content_rowid=content_rowid,
+        )
 
     @staticmethod
     def _fts_statement(

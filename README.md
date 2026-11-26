@@ -1,6 +1,6 @@
 # cli-agent
 
-An autonomous AI developer agent running directly on developer workstations via Google Cloud Vertex AI (Gemini 3.8 Flash, Gemini 3.1 Pro, Claude, etc.). Features non-blocking async execution, surgical code editing, AST structural intelligence, sandboxed shell execution, ephemeral Git worktrees, SQLite memory with FTS5, and an interactive terminal REPL powered by `prompt_toolkit` and `Rich`.
+An autonomous AI developer agent running directly on developer workstations via Google Cloud Vertex AI (Gemini 3.8 Flash, Gemini 3.1 Pro, Claude, etc.). Features non-blocking async execution, surgical code editing, AST structural intelligence, sandboxed shell execution, ephemeral Git worktrees, Turso-backed persistence and full-text search, and an interactive terminal REPL powered by `prompt_toolkit` and `Rich`.
 
 ---
 
@@ -41,7 +41,7 @@ FastEmbed model weights are not downloaded by normal CLI searches. To provision 
 - **Autonomous Multi-Agent Swarm (ODD):** Decompose complex goals into isolated Feature Worker and QA Verifier subagents.
 - **Self-Healing TDD Loop:** Automatic Red-Green-Refactor test repair loop with regression detection.
 - **PR & CI Synthesizer:** Automatic Conventional Commit and ISO/IEC 25010 compliant Pull/Merge Request generation and CI watch/healing.
-- **Persistent SQLite Memory:** Project-scoped and global full-text search (FTS5) for past architectural decisions, discoveries, and conventions.
+- **Persistent Turso Memory:** Project-scoped and global full-text search for past architectural decisions, discoveries, and conventions.
 
 ---
 
@@ -297,8 +297,13 @@ timeout = 300.0
 
 ### Storage Backends
 
-SQLite remains the zero-configuration default. To use Turso, install the optional
-driver and provide both the database URL and token:
+Local embedded Turso is the zero-configuration default. Existing
+`~/.config/cli-agent/memory.db` SQLite data is copied transactionally to
+`memory.turso.db`; the source file is retained unchanged. Full-text indexes are
+rebuilt using Turso's native FTS index instead of SQLite FTS5 virtual tables.
+
+To synchronize with a Turso Cloud database, install the optional libSQL driver
+and provide both the database URL and token:
 
 ```bash
 pip install 'cli-agent[turso]'
@@ -310,10 +315,10 @@ export TURSO_AUTH_TOKEN='your-database-token'
 The default `TURSO_MODE=replica` keeps a local embedded replica and synchronizes
 it with Turso. Set `TURSO_MODE=remote` to connect directly without a local
 replica; `TURSO_SYNC_INTERVAL` controls replica sync frequency (default: 30
-seconds), and `TURSO_REPLICA_PATH` optionally selects the replica file. The
-authentication token is read only from `TURSO_AUTH_TOKEN`, never from the TOML
-configuration. On first Turso use, the legacy `~/.config/cli-agent/memory.db`
-is migrated transactionally; the source database is left unchanged.
+seconds), and `TURSO_REPLICA_PATH` optionally selects the local database file.
+The authentication token is read only from `TURSO_AUTH_TOKEN`, never from the
+TOML configuration. With Cloud credentials configured, legacy SQLite data is
+imported into the embedded replica before stores initialize.
 
 ---
 
