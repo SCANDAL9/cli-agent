@@ -34,6 +34,19 @@ def temp_indexer(temp_graph_store: CodeGraphStore) -> CodeGraphIndexer:
 
 @pytest.mark.unit
 class TestCodeGraphStore:
+    def test_remove_file_symbols_removes_edges_and_metadata(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        symbol = CodeSymbol("caller", "function", 1, 2)
+        edge = SymbolEdge("target", "calls")
+        temp_graph_store.save_file_symbols("remove", "/src/a.py", [(symbol, [edge])], 12.0)
+
+        temp_graph_store.remove_file_symbols("remove", "/src/a.py")
+
+        assert temp_graph_store.get_file_symbols("remove", "/src/a.py") == []
+        assert temp_graph_store.get_file_mtime("remove", "/src/a.py") is None
+        assert temp_graph_store.get_stats("remove") == {"files": 0, "symbols": 0, "edges": 0}
+
     def test_save_and_retrieve_symbols(self, temp_graph_store: CodeGraphStore) -> None:
         sym = CodeSymbol(
             symbol_name="Calculator",

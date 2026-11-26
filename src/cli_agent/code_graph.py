@@ -165,6 +165,20 @@ class CodeGraphStore:
             )
             conn.commit()
 
+    def remove_file_symbols(self, project_key: str, file_path: str) -> None:
+        """Removes one file's graph records and incremental-index metadata atomically."""
+        norm_path = os.path.normpath(file_path)
+        with self._get_connection() as conn:
+            conn.execute(
+                "DELETE FROM code_symbols WHERE project_key = ? AND file_path = ?",
+                (project_key, norm_path),
+            )
+            conn.execute(
+                "DELETE FROM file_metadata WHERE project_key = ? AND file_path = ?",
+                (project_key, norm_path),
+            )
+            conn.commit()
+
     def save_file_symbols(
         self,
         project_key: str,
@@ -223,7 +237,6 @@ class CodeGraphStore:
                     """,
                     (project_key, norm_path, mtime),
                 )
-            conn.commit()
 
     def get_file_symbols(self, project_key: str, file_path: str) -> list[dict[str, Any]]:
         norm_path = os.path.normpath(file_path)
