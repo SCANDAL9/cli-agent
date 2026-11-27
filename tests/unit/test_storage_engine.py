@@ -19,12 +19,14 @@ from cli_agent.storage import (
     StorageBackendUnavailable,
     StorageMigrationConflict,
     TursoEngine,
+    TursoLocalEngine,
     clear_storage_engine_cache,
     create_storage_engine,
     get_storage_engine,
     migrate_legacy_database,
     resolve_store_engine,
 )
+from cli_agent.workflows.history import WorkflowHistoryStore
 
 
 @pytest.mark.unit
@@ -47,6 +49,17 @@ def test_sqlite_engine_executes_rows_many_and_transactions(tmp_path: Path):
         )
 
     assert engine.execute("SELECT id FROM records ORDER BY id") == [{"id": 1}, {"id": 2}]
+    engine.close()
+
+
+@pytest.mark.unit
+def test_sqlite_engine_applies_synchronous_mode_to_each_connection(tmp_path: Path):
+    engine = SQLiteEngine(tmp_path / "synchronous.db", synchronous="NORMAL")
+
+    for _ in range(2):
+        with engine.connect() as connection:
+            assert int(connection.execute("PRAGMA synchronous").fetchone()[0]) == 1
+
     engine.close()
 
 
@@ -233,10 +246,73 @@ def test_turso_engine_supports_real_libsql_local_db_api(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_storage_factory_defaults_to_sqlite_without_turso_credentials(tmp_path: Path):
+def test_storage_factory_defaults_to_local_turso_without_cloud_credentials(tmp_path: Path):
     engine = create_storage_engine(tmp_path / "memory.db", StorageConfig())
 
-    assert isinstance(engine, SQLiteEngine)
+    assert isinstance(engine, TursoLocalEngine)
+    assert engine.local_database_path == tmp_path / "memory.turso.db"
+
+
+@pytest.mark.unit
+def test_turso_local_engine_uses_native_driver_and_reuses_connection(monkeypatch, tmp_path: Path):
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeConnection:
+        def __init__(self):
+            self.connection = sqlite3.connect(":memory:")
+
+        def cursor(self):
+            return self.connection.cursor()
+
+        def execute(self, sql, parameters=()):
+            return self.connection.execute(sql, parameters)
+
+        def executemany(self, sql, parameters):
+            return self.connection.executemany(sql, parameters)
+
+        def commit(self):
+            self.connection.commit()
+
+        def rollback(self):
+            self.connection.rollback()
+
+        def close(self):
+            self.connection.close()
+
+    fake_connection = FakeConnection()
+    fake_module = ModuleType("turso")
+
+    def fake_connect(database, **kwargs):
+        calls.append((database, kwargs))
+        return fake_connection
+
+    fake_module.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "turso", fake_module)
+    path = tmp_path / "local.turso.db"
+    engine = TursoLocalEngine(path)
+
+    engine.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT)")
+    engine.executemany("INSERT INTO records (value) VALUES (?)", [("alpha",), ("beta",)])
+
+    assert engine.execute("SELECT value FROM records") == [
+        {"value": "alpha"},
+        {"value": "beta"},
+    ]
+    assert calls == [(str(path), {"experimental_features": "index_method"})]
+    engine.close()
+
+
+@pytest.mark.unit
+def test_turso_local_engine_generates_native_fts_index_sql(tmp_path: Path):
+    engine = TursoLocalEngine(tmp_path / "local.turso.db")
+
+    assert engine.fts_table_statement(
+        "memories_fts",
+        ("title", "content"),
+        content_table="memories",
+        content_rowid="id",
+    ) == ('CREATE INDEX IF NOT EXISTS "memories_fts" ON "memories" USING fts("title", "content")')
+    engine.close()
 
 
 @pytest.mark.unit
@@ -394,7 +470,10 @@ def test_storage_factory_rejects_partial_turso_configuration(tmp_path: Path):
     ("config", "message"),
     [
         (StorageConfig(backend="unknown"), "Storage backend must be"),
-        (StorageConfig(backend="turso"), "requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN"),
+        (
+            StorageConfig(backend="turso", turso_mode="remote"),
+            "remote Turso storage requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN",
+        ),
     ],
 )
 def test_storage_factory_rejects_invalid_backend_or_missing_turso_credentials(
@@ -704,11 +783,14 @@ def test_all_persistent_stores_share_the_default_engine_for_a_custom_database(tm
         HybridSearchEngine(database_path),
     ]
     engine = stores[0].storage_engine
+    WorkflowHistoryStore(engine)
 
     assert all(store.storage_engine is engine for store in stores)
-    table_names = {
-        row["name"] for row in engine.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
+    assert isinstance(engine, TursoLocalEngine)
+    assert engine.local_database_path == tmp_path / "shared.turso.db"
+    objects = engine.execute("SELECT type, name FROM sqlite_master")
+    table_names = {row["name"] for row in objects if row["type"] == "table"}
+    index_names = {row["name"] for row in objects if row["type"] == "index"}
     assert {
         "memories",
         "sessions",
@@ -716,9 +798,13 @@ def test_all_persistent_stores_share_the_default_engine_for_a_custom_database(tm
         "symbol_edges",
         "file_metadata",
         "code_chunks",
-        "memories_fts",
-        "code_chunks_fts",
+        "workflow_runs",
+        "workflow_steps",
     } <= table_names
+    if engine.fts_dialect == "turso":
+        assert {"memories_fts", "code_chunks_fts"} <= index_names
+    else:
+        assert {"memories_fts", "code_chunks_fts"} <= table_names
     clear_storage_engine_cache()
 
 
@@ -744,10 +830,29 @@ def _create_legacy_database(path: Path) -> None:
             CREATE TABLE sessions (id TEXT PRIMARY KEY, messages_json TEXT NOT NULL);
             CREATE TABLE code_symbols (id INTEGER PRIMARY KEY, symbol_name TEXT NOT NULL);
             CREATE TABLE code_chunks (id INTEGER PRIMARY KEY, content TEXT NOT NULL);
+            CREATE TABLE workflow_runs (
+                run_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                inputs_json TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT
+            );
+            CREATE TABLE workflow_steps (
+                run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+                step_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (run_id, step_id)
+            );
             INSERT INTO memories VALUES (17, 'Needle', 'searchable memory');
             INSERT INTO sessions VALUES ('sess-1', '[{"role":"user"}]');
             INSERT INTO code_symbols VALUES (23, 'build_index');
             INSERT INTO code_chunks VALUES (31, 'graph-indexed chunk');
+            INSERT INTO workflow_runs (run_id, workflow_id, status, inputs_json)
+                VALUES ('run-1', 'verify', 'completed', '{}');
+            INSERT INTO workflow_steps (run_id, step_id, status)
+                VALUES ('run-1', 'test', 'completed');
             """
         )
 
@@ -768,12 +873,20 @@ def test_legacy_migration_preserves_all_tables_and_is_idempotent(tmp_path: Path)
         "sessions",
         "code_symbols",
         "code_chunks",
+        "workflow_runs",
+        "workflow_steps",
     }
     assert second.already_migrated is True
     assert engine.execute("SELECT id, title FROM memories") == [{"id": 17, "title": "Needle"}]
     assert engine.execute("SELECT id FROM sessions") == [{"id": "sess-1"}]
     assert engine.execute("SELECT id FROM code_symbols") == [{"id": 23}]
     assert engine.execute("SELECT id FROM code_chunks") == [{"id": 31}]
+    assert engine.execute("SELECT workflow_id, status FROM workflow_runs") == [
+        {"workflow_id": "verify", "status": "completed"}
+    ]
+    assert engine.execute("SELECT step_id, status FROM workflow_steps") == [
+        {"step_id": "test", "status": "completed"}
+    ]
     assert engine.execute(
         "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?", ("Needle",)
     ) == [{"rowid": 17}]
@@ -783,6 +896,74 @@ def test_legacy_migration_preserves_all_tables_and_is_idempotent(tmp_path: Path)
     ) == [{"rowid": 18}]
     with sqlite3.connect(source) as connection:
         assert connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    engine.close()
+
+
+@pytest.mark.unit
+def test_legacy_migration_rebuilds_external_fts5_as_native_turso_index(tmp_path: Path):
+    pytest.importorskip("turso")
+    source = tmp_path / "legacy.db"
+    target = tmp_path / "active.turso.db"
+    _create_legacy_database(source)
+    original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    engine = TursoLocalEngine(target)
+
+    report = migrate_legacy_database(source, engine)
+
+    assert report.migrated is True
+    assert engine.execute(
+        "SELECT id FROM memories WHERE fts_match(title, content, ?)", ("searchable",)
+    ) == [{"id": 17}]
+    assert engine.execute("SELECT workflow_id, status FROM workflow_runs") == [
+        {"workflow_id": "verify", "status": "completed"}
+    ]
+    assert engine.execute("SELECT step_id, status FROM workflow_steps") == [
+        {"step_id": "test", "status": "completed"}
+    ]
+    engine.execute(
+        "INSERT INTO memories (id, title, content) VALUES (?, ?, ?)",
+        (18, "Fresh", "turso indexed"),
+    )
+    assert engine.execute(
+        "SELECT id FROM memories WHERE fts_match(title, content, ?)", ("turso",)
+    ) == [{"id": 18}]
+    engine.execute("DELETE FROM memories WHERE id = ?", (17,))
+    assert (
+        engine.execute(
+            "SELECT id FROM memories WHERE fts_match(title, content, ?)", ("searchable",)
+        )
+        == []
+    )
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original_hash
+    assert engine.execute("PRAGMA integrity_check") == [{"integrity_check": "ok"}]
+    engine.close()
+
+
+@pytest.mark.unit
+def test_turso_legacy_migration_conflict_rolls_back_import(tmp_path: Path):
+    pytest.importorskip("turso")
+    source = tmp_path / "legacy.db"
+    target = tmp_path / "active.turso.db"
+    _create_legacy_database(source)
+    original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    engine = TursoLocalEngine(target)
+    engine.execute(
+        "CREATE TABLE memories (id INTEGER PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL)"
+    )
+    engine.execute(
+        "INSERT INTO memories (id, title, content) VALUES (?, ?, ?)",
+        (17, "Conflicting", "not the legacy row"),
+    )
+
+    with pytest.raises(StorageMigrationConflict, match="memories"):
+        migrate_legacy_database(source, engine)
+
+    assert engine.execute("SELECT id, title FROM memories") == [{"id": 17, "title": "Conflicting"}]
+    assert (
+        engine.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'")
+        == []
+    )
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original_hash
     engine.close()
 
 

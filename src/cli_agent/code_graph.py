@@ -1,9 +1,11 @@
 """
 Tree-sitter AST & Code Intelligence Graph for cli-agent.
 Extracts symbols (classes, functions, methods), signatures, docstrings, and relationships
-(calls, inheritance, imports) into a persistent SQLite knowledge graph.
+(calls, inheritance, imports) into a rebuildable Turso graph cache.
 """
 
+import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -11,15 +13,23 @@ from pathlib import Path
 from typing import Any
 
 import tree_sitter_python as tspython
-from tree_sitter import Language, Node, Parser
+from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 from .config import StorageConfig
 from .memory import DEFAULT_DB_PATH, resolve_project_key
 from .storage import StorageConnection, StorageEngine, resolve_store_engine
 
 PY_LANGUAGE = Language(tspython.language())
+PY_CALL_QUERY = Query(
+    PY_LANGUAGE,
+    """
+    (call function: (identifier) @function) @call
+    (call function: (attribute attribute: (identifier) @function)) @call
+    """,
+)
 
 SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"}
+DEFAULT_CODE_GRAPH_DB_PATH = DEFAULT_DB_PATH.with_name("code_graph.db")
 
 
 def _node_text(node: Node | None) -> str:
@@ -65,7 +75,7 @@ class SymbolEdge:
 
 
 class CodeGraphStore:
-    """Persistent SQLite store for AST code symbols and dependency graph edges."""
+    """Persistent Turso cache for AST code symbols and dependency graph edges."""
 
     def __init__(
         self,
@@ -74,13 +84,25 @@ class CodeGraphStore:
         storage_engine: StorageEngine | None = None,
         storage_config: StorageConfig | None = None,
     ):
-        self.storage_engine = resolve_store_engine(
-            DEFAULT_DB_PATH,
-            Path(db_path) if db_path is not None else None,
-            storage_engine,
-            storage_config,
-        )
-        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+        if storage_engine is None and db_path is None:
+            self.db_path = DEFAULT_CODE_GRAPH_DB_PATH
+            graph_storage_config = storage_config or StorageConfig(
+                backend="turso",
+                replica_path=self.db_path,
+                synchronous="NORMAL",
+            )
+            self.storage_engine = resolve_store_engine(
+                self.db_path,
+                storage_config=graph_storage_config,
+            )
+        else:
+            self.storage_engine = resolve_store_engine(
+                DEFAULT_DB_PATH,
+                Path(db_path) if db_path is not None else None,
+                storage_engine,
+                storage_config,
+            )
+            self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -126,12 +148,25 @@ class CodeGraphStore:
                 "CREATE INDEX IF NOT EXISTS idx_edges_lookup ON symbol_edges(target_symbol_name);"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edges_source ON symbol_edges(source_symbol_id);"
+            )
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS file_metadata (
                     project_key TEXT NOT NULL,
                     file_path TEXT NOT NULL,
                     mtime REAL NOT NULL,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (project_key, file_path)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_graph_state (
+                    project_key TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    graph_digest TEXT NOT NULL,
                     PRIMARY KEY (project_key, file_path)
                 );
                 """
@@ -165,6 +200,72 @@ class CodeGraphStore:
             )
             conn.commit()
 
+    def remove_file_symbols(self, project_key: str, file_path: str) -> None:
+        """Removes one file's graph records and incremental-index metadata atomically."""
+        norm_path = os.path.normpath(file_path)
+        with self._get_connection() as conn:
+            conn.execute(
+                "DELETE FROM code_symbols WHERE project_key = ? AND file_path = ?",
+                (project_key, norm_path),
+            )
+            conn.execute(
+                "DELETE FROM file_metadata WHERE project_key = ? AND file_path = ?",
+                (project_key, norm_path),
+            )
+            conn.execute(
+                "DELETE FROM file_graph_state WHERE project_key = ? AND file_path = ?",
+                (project_key, norm_path),
+            )
+            conn.commit()
+
+    def remove_stale_files(
+        self,
+        project_key: str,
+        root_dir: Path | str,
+        current_file_paths: set[str],
+    ) -> int:
+        """Atomically removes cached graph rows missing from a complete scan of one root."""
+        root_path = os.path.normpath(str(Path(root_dir).resolve()))
+        current_paths = {
+            os.path.normpath(str(Path(file_path).resolve())) for file_path in current_file_paths
+        }
+        with self._get_connection() as conn:
+            conn.execute(self.storage_engine.migration_transaction_sql)
+            rows = conn.execute(
+                """
+                SELECT file_path FROM code_symbols WHERE project_key = ?
+                UNION SELECT file_path FROM file_metadata WHERE project_key = ?
+                UNION SELECT file_path FROM file_graph_state WHERE project_key = ?
+                """,
+                (project_key, project_key, project_key),
+            ).fetchall()
+            stale_paths: set[str] = set()
+            for row in rows:
+                file_path = os.path.normpath(row["file_path"])
+                try:
+                    inside_root = os.path.commonpath((root_path, file_path)) == root_path
+                except ValueError:
+                    inside_root = False
+                if inside_root and file_path not in current_paths:
+                    stale_paths.add(file_path)
+
+            if stale_paths:
+                parameters = [(project_key, file_path) for file_path in stale_paths]
+                conn.executemany(
+                    "DELETE FROM code_symbols WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+                conn.executemany(
+                    "DELETE FROM file_metadata WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+                conn.executemany(
+                    "DELETE FROM file_graph_state WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+            conn.commit()
+        return len(stale_paths)
+
     def save_file_symbols(
         self,
         project_key: str,
@@ -172,48 +273,32 @@ class CodeGraphStore:
         symbols_with_edges: list[tuple[CodeSymbol, list[SymbolEdge]]],
         mtime: float | None = None,
     ) -> None:
-        """Atomically replaces symbols and edges for a given file."""
-        norm_path = os.path.normpath(file_path)
+        """Atomically synchronizes one file's symbols and edges."""
+        self.save_files_symbols([(project_key, file_path, symbols_with_edges, mtime)])
+
+    def save_files_symbols(
+        self,
+        files: list[tuple[str, str, list[tuple[CodeSymbol, list[SymbolEdge]]], float | None]],
+    ) -> None:
+        """Atomically synchronizes several files in a single storage transaction."""
+        if not files:
+            return
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            # Delete old symbols (foreign keys cascade will remove old edges)
-            cursor.execute(
-                "DELETE FROM code_symbols WHERE project_key = ? AND file_path = ?",
-                (project_key, norm_path),
-            )
-
-            for sym, edges in symbols_with_edges:
-                cursor.execute(
-                    """
-                    INSERT INTO code_symbols (
-                        project_key, file_path, symbol_name, symbol_type,
-                        signature, docstring, start_line, end_line
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project_key,
-                        norm_path,
-                        sym.symbol_name,
-                        sym.symbol_type,
-                        sym.signature,
-                        sym.docstring,
-                        sym.start_line,
-                        sym.end_line,
-                    ),
+            conn.execute(self.storage_engine.migration_transaction_sql)
+            metadata_updates: list[tuple[str, str, float]] = []
+            graph_state_updates: list[tuple[str, str, str]] = []
+            for project_key, file_path, symbols_with_edges, mtime in files:
+                self._save_file_symbols_in_transaction(
+                    conn,
+                    project_key,
+                    file_path,
+                    symbols_with_edges,
+                    mtime,
+                    metadata_updates,
+                    graph_state_updates,
                 )
-                sym_id = cursor.lastrowid
-                if sym_id:
-                    for edge in edges:
-                        cursor.execute(
-                            """
-                            INSERT INTO symbol_edges (source_symbol_id, target_symbol_name, relationship_type)
-                            VALUES (?, ?, ?)
-                            """,
-                            (sym_id, edge.target_symbol_name, edge.relationship_type),
-                        )
-
-            if mtime is not None:
-                cursor.execute(
+            if metadata_updates:
+                conn.executemany(
                     """
                     INSERT INTO file_metadata (project_key, file_path, mtime, updated_at)
                     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -221,9 +306,262 @@ class CodeGraphStore:
                         mtime = excluded.mtime,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    (project_key, norm_path, mtime),
+                    metadata_updates,
                 )
-            conn.commit()
+            if graph_state_updates:
+                conn.executemany(
+                    """
+                    INSERT INTO file_graph_state (project_key, file_path, graph_digest)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(project_key, file_path) DO UPDATE SET
+                        graph_digest = excluded.graph_digest
+                    """,
+                    graph_state_updates,
+                )
+
+    def _save_file_symbols_in_transaction(
+        self,
+        conn: StorageConnection,
+        project_key: str,
+        file_path: str,
+        symbols_with_edges: list[tuple[CodeSymbol, list[SymbolEdge]]],
+        mtime: float | None,
+        metadata_updates: list[tuple[str, str, float]],
+        graph_state_updates: list[tuple[str, str, str]],
+    ) -> None:
+        norm_path = os.path.normpath(file_path)
+        next_graph = [
+            (
+                (
+                    sym.symbol_name,
+                    sym.symbol_type,
+                    sym.signature,
+                    sym.docstring,
+                    sym.start_line,
+                    sym.end_line,
+                ),
+                [(edge.target_symbol_name, edge.relationship_type) for edge in edges],
+            )
+            for sym, edges in symbols_with_edges
+        ]
+        graph_digest = hashlib.blake2b(
+            json.dumps(next_graph, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        state = conn.execute(
+            "SELECT graph_digest FROM file_graph_state WHERE project_key = ? AND file_path = ?",
+            (project_key, norm_path),
+        ).fetchone()
+        if state is not None and state["graph_digest"] == graph_digest:
+            if mtime is not None:
+                metadata_updates.append((project_key, norm_path, mtime))
+            return
+
+        cursor = conn.execute(
+            """
+            SELECT s.id, s.symbol_name, s.symbol_type, s.signature, s.docstring,
+                   s.start_line, s.end_line, e.id AS edge_id,
+                   e.target_symbol_name, e.relationship_type
+            FROM code_symbols s
+            LEFT JOIN symbol_edges e ON e.source_symbol_id = s.id
+            WHERE s.project_key = ? AND s.file_path = ?
+            ORDER BY s.start_line, s.end_line, s.id, e.id
+            """,
+            (project_key, norm_path),
+        )
+        existing_records: list[dict[str, Any]] = []
+        previous_id = None
+        current_record: dict[str, Any] | None = None
+        for row in cursor.fetchall():
+            if row["id"] != previous_id:
+                current_record = {
+                    "id": row["id"],
+                    "fields": (
+                        row["symbol_name"],
+                        row["symbol_type"],
+                        row["signature"],
+                        row["docstring"],
+                        row["start_line"],
+                        row["end_line"],
+                    ),
+                    "edges": [],
+                    "edge_records": [],
+                }
+                existing_records.append(current_record)
+                previous_id = row["id"]
+            if row["target_symbol_name"] is not None:
+                assert current_record is not None
+                current_record["edges"].append(
+                    (row["target_symbol_name"], row["relationship_type"])
+                )
+                current_record["edge_records"].append(
+                    (row["edge_id"], row["target_symbol_name"], row["relationship_type"])
+                )
+
+        existing_graph = [(record["fields"], record["edges"]) for record in existing_records]
+        if existing_graph != next_graph:
+            existing_by_position: dict[tuple[str, int, int, int], dict[str, Any]] = {}
+            existing_occurrences: dict[tuple[str, int, int], int] = {}
+            for record in existing_records:
+                fields = record["fields"]
+                base = (fields[1], fields[4], fields[5])
+                occurrence = existing_occurrences.get(base, 0)
+                existing_occurrences[base] = occurrence + 1
+                existing_by_position[(*base, occurrence)] = record
+
+            matched_ids: set[int] = set()
+            next_occurrences: dict[tuple[str, int, int], int] = {}
+            updates: list[tuple[Any, ...]] = []
+            edge_updates: list[tuple[str, str, int]] = []
+            edge_deletions: list[tuple[int]] = []
+            edge_rows: list[tuple[int, str, str]] = []
+            new_symbols: list[tuple[CodeSymbol, list[SymbolEdge]]] = []
+
+            for (symbol, edges), (fields, next_edges) in zip(
+                symbols_with_edges, next_graph, strict=True
+            ):
+                base = (symbol.symbol_type, symbol.start_line, symbol.end_line)
+                occurrence = next_occurrences.get(base, 0)
+                next_occurrences[base] = occurrence + 1
+                existing = existing_by_position.get((*base, occurrence))
+                if existing is None:
+                    new_symbols.append((symbol, edges))
+                    continue
+
+                symbol_id = existing["id"]
+                matched_ids.add(symbol_id)
+                if existing["fields"] != fields:
+                    updates.append((*fields, symbol_id))
+                if existing["edges"] != next_edges:
+                    existing_edges = existing["edge_records"]
+                    common_count = min(len(existing_edges), len(edges))
+                    for index in range(common_count):
+                        edge_id, target_name, relationship_type = existing_edges[index]
+                        edge = edges[index]
+                        if (target_name, relationship_type) != (
+                            edge.target_symbol_name,
+                            edge.relationship_type,
+                        ):
+                            edge_updates.append(
+                                (edge.target_symbol_name, edge.relationship_type, edge_id)
+                            )
+                    edge_deletions.extend(
+                        (edge_id,) for edge_id, _, _ in existing_edges[common_count:]
+                    )
+                    edge_rows.extend(
+                        (symbol_id, edge.target_symbol_name, edge.relationship_type)
+                        for edge in edges[common_count:]
+                    )
+
+            removed_ids = [
+                (record["id"],) for record in existing_records if record["id"] not in matched_ids
+            ]
+            if len(removed_ids) == 1:
+                conn.execute("DELETE FROM code_symbols WHERE id = ?", removed_ids[0])
+            elif removed_ids:
+                conn.executemany("DELETE FROM code_symbols WHERE id = ?", removed_ids)
+
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE code_symbols
+                    SET symbol_name = ?, symbol_type = ?, signature = ?, docstring = ?,
+                        start_line = ?, end_line = ?
+                    WHERE id = ?
+                    """,
+                    updates,
+                )
+
+            if edge_updates:
+                conn.executemany(
+                    "UPDATE symbol_edges SET target_symbol_name = ?, relationship_type = ? WHERE id = ?",
+                    edge_updates,
+                )
+
+            if edge_deletions:
+                conn.executemany("DELETE FROM symbol_edges WHERE id = ?", edge_deletions)
+
+            if new_symbols:
+                conn.executemany(
+                    """
+                    INSERT INTO code_symbols (
+                        project_key, file_path, symbol_name, symbol_type,
+                        signature, docstring, start_line, end_line
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            project_key,
+                            norm_path,
+                            symbol.symbol_name,
+                            symbol.symbol_type,
+                            symbol.signature,
+                            symbol.docstring,
+                            symbol.start_line,
+                            symbol.end_line,
+                        )
+                        for symbol, _ in new_symbols
+                    ],
+                )
+
+                if any(edges for _, edges in new_symbols):
+                    cursor = conn.execute(
+                        """
+                        SELECT id, symbol_name, symbol_type, signature, docstring,
+                               start_line, end_line
+                        FROM code_symbols
+                        WHERE project_key = ? AND file_path = ?
+                        ORDER BY id
+                        """,
+                        (project_key, norm_path),
+                    )
+                    new_ids_by_fields: dict[tuple[Any, ...], list[int]] = {}
+                    for row in cursor.fetchall():
+                        if row["id"] in matched_ids:
+                            continue
+                        fields = (
+                            row["symbol_name"],
+                            row["symbol_type"],
+                            row["signature"],
+                            row["docstring"],
+                            row["start_line"],
+                            row["end_line"],
+                        )
+                        new_ids_by_fields.setdefault(fields, []).append(row["id"])
+
+                    for symbol, edges in new_symbols:
+                        if not edges:
+                            continue
+                        fields = (
+                            symbol.symbol_name,
+                            symbol.symbol_type,
+                            symbol.signature,
+                            symbol.docstring,
+                            symbol.start_line,
+                            symbol.end_line,
+                        )
+                        symbol_ids = new_ids_by_fields.get(fields)
+                        if not symbol_ids:
+                            raise RuntimeError("Unable to resolve an inserted symbol ID.")
+                        symbol_id = symbol_ids.pop(0)
+                        edge_rows.extend(
+                            (symbol_id, edge.target_symbol_name, edge.relationship_type)
+                            for edge in edges
+                        )
+
+            if edge_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO symbol_edges (
+                        source_symbol_id, target_symbol_name, relationship_type
+                    ) VALUES (?, ?, ?)
+                    """,
+                    edge_rows,
+                )
+
+        graph_state_updates.append((project_key, norm_path, graph_digest))
+        if mtime is not None:
+            metadata_updates.append((project_key, norm_path, mtime))
 
     def get_file_symbols(self, project_key: str, file_path: str) -> list[dict[str, Any]]:
         norm_path = os.path.normpath(file_path)
@@ -288,6 +626,139 @@ class CodeGraphStore:
                 (project_key, symbol_name),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def _edge_neighbors(
+        self,
+        project_key: str,
+        symbol: dict[str, Any],
+        relationship_type: str,
+        direction: str,
+    ) -> list[dict[str, Any]]:
+        if direction == "outgoing":
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT target_symbol_name FROM symbol_edges "
+                    "WHERE source_symbol_id = ? AND relationship_type = ? "
+                    "ORDER BY target_symbol_name",
+                    (symbol.get("id"), relationship_type),
+                )
+                target_names = [row["target_symbol_name"] for row in cursor.fetchall()]
+
+            neighbors: list[dict[str, Any]] = []
+            for target_name in target_names:
+                definitions = self.find_definition(project_key, target_name)
+                if definitions:
+                    neighbors.extend(definitions)
+                else:
+                    neighbors.append(
+                        {
+                            "symbol_name": target_name,
+                            "file_path": None,
+                            "start_line": None,
+                        }
+                    )
+            return neighbors
+
+        if direction != "incoming":
+            raise ValueError("direction must be 'incoming' or 'outgoing'.")
+
+        symbol_name = str(symbol.get("symbol_name") or "")
+        names = sorted({symbol_name, symbol_name.rsplit(".", 1)[-1]} - {""})
+        placeholders = ", ".join("?" for _ in names)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT DISTINCT s.id, s.file_path, s.symbol_name, s.symbol_type,
+                       s.signature, s.docstring, s.start_line, s.end_line
+                FROM symbol_edges e
+                JOIN code_symbols s ON e.source_symbol_id = s.id
+                WHERE s.project_key = ? AND e.relationship_type = ?
+                  AND e.target_symbol_name IN ({placeholders})
+                ORDER BY s.file_path, s.start_line, s.symbol_name
+                """,
+                (project_key, relationship_type, *names),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _walk_edges(
+        store: "CodeGraphStore",
+        project_key: str,
+        roots: list[dict[str, Any]],
+        relationship_type: str,
+        direction: str,
+        max_depth: int,
+    ) -> list[dict[str, Any]]:
+        queue = [(root, 0) for root in roots]
+        seen = {
+            (root.get("symbol_name"), root.get("file_path"), root.get("start_line"))
+            for root in roots
+        }
+        result: list[dict[str, Any]] = []
+
+        while queue:
+            current, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            neighbors = store._edge_neighbors(project_key, current, relationship_type, direction)
+            for neighbor in neighbors:
+                key = (
+                    neighbor.get("symbol_name"),
+                    neighbor.get("file_path"),
+                    neighbor.get("start_line"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                item = {**neighbor, "depth": depth + 1}
+                result.append(item)
+                queue.append((neighbor, depth + 1))
+
+        return sorted(
+            result,
+            key=lambda item: (
+                item["depth"],
+                item.get("file_path") or "",
+                item.get("start_line") or 0,
+                item.get("symbol_name") or "",
+            ),
+        )
+
+    def get_symbol_call_tree(
+        self, project_key: str, symbol_name: str, max_depth: int = 3
+    ) -> dict[str, Any]:
+        """Returns bounded upstream callers and downstream callees for indexed symbols."""
+        definitions = self.find_definition(project_key, symbol_name)
+        return {
+            "symbol_name": symbol_name,
+            "project_key": project_key,
+            "definitions": definitions,
+            "callers": self._walk_edges(
+                self, project_key, definitions, "calls", "incoming", max_depth
+            ),
+            "callees": self._walk_edges(
+                self, project_key, definitions, "calls", "outgoing", max_depth
+            ),
+            "max_depth": max_depth,
+        }
+
+    def get_type_hierarchy(
+        self, project_key: str, symbol_name: str, max_depth: int = 3
+    ) -> dict[str, Any]:
+        """Returns bounded base types and derived implementations from inheritance edges."""
+        definitions = self.find_definition(project_key, symbol_name)
+        return {
+            "symbol_name": symbol_name,
+            "project_key": project_key,
+            "definitions": definitions,
+            "bases": self._walk_edges(
+                self, project_key, definitions, "inherits", "outgoing", max_depth
+            ),
+            "derived": self._walk_edges(
+                self, project_key, definitions, "inherits", "incoming", max_depth
+            ),
+            "max_depth": max_depth,
+        }
 
     def get_symbol_impact(self, project_key: str, symbol_name: str) -> dict[str, Any]:
         """
@@ -399,30 +870,21 @@ class CodeGraphIndexer:
                 break
         return ""
 
-    def _extract_calls(self, node: Node) -> list[str]:
-        calls: list[str] = []
-
-        def traverse(curr: Node) -> None:
-            if curr.type == "call":
-                fn = curr.child_by_field_name("function")
-                if fn:
-                    if fn.type == "identifier":
-                        calls.append(_node_text(fn))
-                    elif fn.type == "attribute":
-                        attr = fn.child_by_field_name("attribute")
-                        if attr:
-                            calls.append(_node_text(attr))
-            for ch in curr.children:
-                traverse(ch)
-
-        traverse(node)
-        return calls
+    def _extract_calls(self, node: Node, cursor: QueryCursor) -> list[str]:
+        ordered_matches = []
+        for order, (_, captures) in enumerate(cursor.matches(node)):
+            call = captures["call"][0]
+            function = captures["function"][0]
+            ordered_matches.append((call.start_byte, -call.end_byte, order, _node_text(function)))
+        ordered_matches.sort()
+        return [name for _, _, _, name in ordered_matches]
 
     def parse_python_source(
         self, code: str, file_path: str, project_key: str
     ) -> list[tuple[CodeSymbol, list[SymbolEdge]]]:
         """Parses Python source code into symbols and dependency edges."""
         tree = self.parser.parse(code.encode("utf-8"))
+        call_cursor = QueryCursor(PY_CALL_QUERY)
         results: list[tuple[CodeSymbol, list[SymbolEdge]]] = []
 
         for child in tree.root_node.children:
@@ -480,7 +942,7 @@ class CodeGraphIndexer:
                             r_str = f" -> {_node_text(mret)}" if mret else ""
                             msig = f"def {mname}{p_str}{r_str}"
 
-                            mcalls = self._extract_calls(bchild)
+                            mcalls = self._extract_calls(bchild, call_cursor)
                             medges = [
                                 SymbolEdge(
                                     target_symbol_name=call_target, relationship_type="calls"
@@ -513,7 +975,7 @@ class CodeGraphIndexer:
                 r_str = f" -> {_node_text(fret)}" if fret else ""
                 fsig = f"def {fname}{p_str}{r_str}"
 
-                fcalls = self._extract_calls(child)
+                fcalls = self._extract_calls(child, call_cursor)
                 fedges = [
                     SymbolEdge(target_symbol_name=call_target, relationship_type="calls")
                     for call_target in fcalls
@@ -653,7 +1115,9 @@ class CodeGraphIndexer:
                     edges: list[SymbolEdge] = []
                     if bases:
                         for b in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", bases):
-                            edges.append(SymbolEdge(target_symbol_name=b, relationship_type="inherits"))
+                            edges.append(
+                                SymbolEdge(target_symbol_name=b, relationship_type="inherits")
+                            )
                     sig = line.strip().rstrip("{").strip()
                     results.append(
                         (
@@ -833,7 +1297,11 @@ class CodeGraphIndexer:
                                     file_path=file_path,
                                     project_key=project_key,
                                 ),
-                                [SymbolEdge(target_symbol_name=trait_name, relationship_type="inherits")],
+                                [
+                                    SymbolEdge(
+                                        target_symbol_name=trait_name, relationship_type="inherits"
+                                    )
+                                ],
                             )
                         )
                     continue
@@ -865,42 +1333,69 @@ class CodeGraphIndexer:
 
         return results
 
-    def index_file(self, file_path: Path | str, project_key: str | None = None) -> int:
-        """Indexes a single source file (.py, .ts, .tsx, .js, .jsx, .go, .rs) into the code graph store."""
+    def _parse_file(
+        self, file_path: Path | str, project_key: str | None
+    ) -> tuple[str, str, list[tuple[CodeSymbol, list[SymbolEdge]]], float] | None:
         path = Path(file_path).resolve()
         if not path.is_file() or path.suffix not in SUPPORTED_EXTENSIONS:
-            return 0
+            return None
 
         p_key = project_key or resolve_project_key()
         try:
             st_mtime = path.stat().st_mtime
             content = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            return 0
+            return None
 
         rel_path = str(path)
         if path.suffix == ".py":
             symbols_with_edges = self.parse_python_source(content, rel_path, p_key)
         else:
             symbols_with_edges = self.parse_polyglot_source(content, rel_path, p_key, path.suffix)
+        return p_key, rel_path, symbols_with_edges, st_mtime
+
+    def index_file(self, file_path: Path | str, project_key: str | None = None) -> int:
+        """Indexes one supported source file into the code graph store."""
+        parsed = self._parse_file(file_path, project_key)
+        if parsed is None:
+            return 0
+        p_key, rel_path, symbols_with_edges, st_mtime = parsed
         self.store.save_file_symbols(p_key, rel_path, symbols_with_edges, mtime=st_mtime)
         return len(symbols_with_edges)
+
+    def index_files(self, file_paths: list[Path | str], project_key: str | None = None) -> int:
+        """Indexes several source files and persists their graphs in one transaction."""
+        parsed_files = [
+            parsed
+            for file_path in file_paths
+            if (parsed := self._parse_file(file_path, project_key)) is not None
+        ]
+        if not parsed_files:
+            return 0
+        self.store.save_files_symbols(parsed_files)
+        return sum(len(symbols_with_edges) for _, _, symbols_with_edges, _ in parsed_files)
 
     def index_directory(
         self,
         dir_path: Path | str,
         project_key: str | None = None,
-        max_files: int = 500,
+        max_files: int | None = 500,
     ) -> int:
-        """Recursively indexes all supported source files under dir_path, skipping unchanged files via st_mtime."""
+        """Indexes supported files, skipping unchanged mtimes and pruning stale paths after a full scan."""
         root = Path(dir_path).resolve()
         if not root.is_dir():
             return 0
 
         p_key = project_key or resolve_project_key()
         indexed_count = 0
+        scan_complete = True
+        current_file_paths: set[str] = set()
 
-        for current_root, dirs, files in os.walk(root):
+        def mark_scan_incomplete(_error: OSError) -> None:
+            nonlocal scan_complete
+            scan_complete = False
+
+        for current_root, dirs, files in os.walk(root, onerror=mark_scan_incomplete):
             # Prune excluded directories in-place
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
 
@@ -910,7 +1405,9 @@ class CodeGraphIndexer:
                     try:
                         current_mtime = full_path.stat().st_mtime
                     except OSError:
+                        scan_complete = False
                         continue
+                    current_file_paths.add(str(full_path))
 
                     cached_mtime = self.store.get_file_mtime(p_key, str(full_path))
                     if cached_mtime is not None and cached_mtime == current_mtime:
@@ -918,7 +1415,9 @@ class CodeGraphIndexer:
 
                     self.index_file(full_path, p_key)
                     indexed_count += 1
-                    if indexed_count >= max_files:
+                    if max_files is not None and indexed_count >= max_files:
                         return indexed_count
 
+        if scan_complete:
+            self.store.remove_stale_files(p_key, root, current_file_paths)
         return indexed_count

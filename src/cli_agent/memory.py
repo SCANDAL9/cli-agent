@@ -1,7 +1,4 @@
-"""
-SQLite-backed persistent memory engine for cli-agent.
-Provides project-scoped memory isolation, full-text search (FTS5), and persistent observations.
-"""
+"""Persistent memory repository with project-scoped full-text search."""
 
 import sqlite3
 import subprocess
@@ -85,41 +82,49 @@ class MemoryStore:
             )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)")
 
-            # FTS5 virtual table for fast keyword search
-            cursor.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    title,
-                    content,
-                    content='memories',
-                    content_rowid='id'
-                );
-                """
-            )
-            # Triggers to keep FTS index in sync with memories table
-            cursor.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                    INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-                END;
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
-                END;
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
-                    INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-                END;
-                """
-            )
+            if self.storage_engine.fts_dialect != "turso":
+                # FTS5 virtual table for SQLite and the libSQL compatibility backend.
+                cursor.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                        title,
+                        content,
+                        content='memories',
+                        content_rowid='id'
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                        INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+                    END;
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                        INSERT INTO memories_fts(memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+                    END;
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                        INSERT INTO memories_fts(memories_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+                        INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
+                    END;
+                    """
+                )
             conn.commit()
+
+        if self.storage_engine.fts_dialect == "turso":
+            self.storage_engine.create_fts_table(
+                "memories_fts",
+                ("title", "content"),
+                content_table="memories",
+                content_rowid="id",
+            )
 
     def save_memory(
         self,
@@ -146,14 +151,38 @@ class MemoryStore:
         project_key: str | None = None,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Searches memories using FTS5 full-text search with fallback to LIKE and project scoping."""
+        """Searches memories with the active engine's full-text index and a LIKE fallback."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             safe_query = "".join(c for c in query if c.isalnum() or c.isspace()).strip()
             if safe_query:
                 try:
                     fts_query = " OR ".join(safe_query.split())
-                    if project_key:
+                    if self.storage_engine.fts_dialect == "turso":
+                        scope_filter = (
+                            " AND (project_key = ? OR scope = 'global')" if project_key else ""
+                        )
+                        parameters: tuple[Any, ...] = (
+                            (fts_query, fts_query, project_key, limit)
+                            if project_key
+                            else (fts_query, fts_query, limit)
+                        )
+                        cursor.execute(
+                            f"""
+                            WITH matched AS (
+                                SELECT id, type, title, content, project_key, scope, created_at,
+                                    fts_score(title, content, ?) AS score
+                                FROM memories
+                                WHERE fts_match(title, content, ?){scope_filter}
+                            )
+                            SELECT id, type, title, content, project_key, scope, created_at
+                            FROM matched
+                            ORDER BY score DESC
+                            LIMIT ?
+                            """,
+                            parameters,
+                        )
+                    elif project_key:
                         cursor.execute(
                             """
                             SELECT m.id, m.type, m.title, m.content, m.project_key, m.scope, m.created_at
@@ -281,7 +310,7 @@ class MemoryStore:
         deduplicate: bool = True,
     ) -> list[dict[str, Any]]:
         """
-        Retrieves contextually relevant memories combining FTS5 semantic/keyword matches
+        Retrieves contextually relevant memories combining full-text/keyword matches
         with recent memories, automatically deduplicating identical (type, title, content) tuples.
         """
         candidates: list[dict[str, Any]] = []

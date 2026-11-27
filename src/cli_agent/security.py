@@ -55,6 +55,13 @@ class SecurityPolicy:
 
     def evaluate_risk(self, tool_name: str, arguments: dict[str, Any]) -> RiskLevel:
         """Classifies tool invocation into SAFE, MEDIUM, or HIGH risk."""
+        if tool_name == "apply_code_action":
+            selection = any(
+                arguments.get(field) is not None
+                for field in ("server_name", "action_index", "action_title", "selection_id")
+            )
+            return RiskLevel.MEDIUM if selection else RiskLevel.SAFE
+
         if tool_name in {
             "read_file",
             "list_directory",
@@ -62,6 +69,9 @@ class SecurityPolicy:
             "lsp_workspace_diagnostics",
             "ast_grep_replace",
             "hybrid_search_code",
+            "semantic_search_code",
+            "get_symbol_call_tree",
+            "get_type_hierarchy",
             "get_symbol_outline",
             "find_symbol_definition",
             "find_symbol_references",
@@ -72,7 +82,12 @@ class SecurityPolicy:
         }:
             return RiskLevel.SAFE
 
-        if tool_name in {"write_file", "edit_file", "stop_background_process"}:
+        if tool_name in {
+            "write_file",
+            "edit_file",
+            "apply_code_action",
+            "stop_background_process",
+        }:
             return RiskLevel.MEDIUM
 
         if tool_name in {"run_command", "start_background_process"}:

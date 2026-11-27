@@ -4,11 +4,13 @@ Unit tests for Wave 5 Phase 3: Headless LSP Semantic Diagnostic Bridge (src/cli_
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
+from cli_agent import lsp as lsp_module
 from cli_agent.events import EventBus, EventTopic, set_event_bus
 from cli_agent.lsp import (
     DiagnosticSeverity,
@@ -133,6 +135,49 @@ class TestFastASTSyntaxCheckFallback:
 
 @pytest.mark.unit
 class TestHeadlessLSPClientAndManager:
+    @pytest.mark.asyncio
+    async def test_code_action_request_preserves_position_diagnostics_and_open_buffer(
+        self, tmp_path: Path
+    ) -> None:
+        manager = HeadlessLSPManager.__new__(HeadlessLSPManager)
+        observed: dict[str, Any] = {}
+
+        class FakeClient:
+            server_name = "fake-lsp"
+            is_ready = True
+
+            async def notify_document(self, uri: str, content: str) -> None:
+                observed["document"] = (uri, content)
+
+            async def request(self, method: str, params: dict[str, Any], timeout_sec: float):
+                observed["request"] = (method, params, timeout_sec)
+                return [{"title": "Add missing import"}]
+
+        async def initialize() -> None:
+            return None
+
+        manager._clients = [cast(HeadlessLSPClient, FakeClient())]
+        manager._init_clients = initialize  # type: ignore[method-assign]
+        uri = (tmp_path / "sample.py").as_uri()
+        position = {"line": 3, "character": 7}
+        diagnostics = [{"message": "Undefined name", "code": "F821"}]
+
+        result = await manager.request_semantic(
+            "textDocument/codeAction",
+            uri,
+            position,
+            document_text="current source",
+            diagnostics=diagnostics,
+        )
+
+        assert result == {"fake-lsp": [{"title": "Add missing import"}]}
+        assert observed["document"] == (uri, "current source")
+        method, params, timeout = observed["request"]
+        assert method == "textDocument/codeAction"
+        assert params["range"] == {"start": position, "end": position}
+        assert params["context"]["diagnostics"] == diagnostics
+        assert timeout > 0
+
     @pytest.mark.asyncio
     async def test_find_executable_discovers_ruff(self) -> None:
         found = _find_executable("ruff")
@@ -275,6 +320,116 @@ class TestToolEnrichmentIntegration:
 
 @pytest.mark.unit
 class TestHeadlessLSPClientEdgeCases:
+    @pytest.mark.asyncio
+    async def test_cancelled_request_is_removed_without_misrouting_late_response(
+        self, tmp_path: Path
+    ) -> None:
+        client = HeadlessLSPClient("test", ["echo"], tmp_path)
+        client._proc = cast(Any, type("Process", (), {"returncode": None})())
+        client._is_ready = True
+        sent: list[dict[str, Any]] = []
+        both_sent = asyncio.Event()
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+            if len(sent) == 2:
+                both_sent.set()
+
+        client._send_message = send  # type: ignore[method-assign]
+        cancelled = asyncio.create_task(client.request("test/cancel", {}, timeout_sec=1.0))
+        surviving = asyncio.create_task(client.request("test/survive", {}, timeout_sec=1.0))
+        await both_sent.wait()
+        cancelled_id, surviving_id = (message["id"] for message in sent)
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+
+        assert list(client._pending_requests) == [surviving_id]
+        client._dispatch_message({"jsonrpc": "2.0", "id": cancelled_id, "result": "late response"})
+        assert not client._pending_requests[surviving_id].done()
+        client._dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "id": surviving_id,
+                "error": {"code": -32603, "message": "expected test error"},
+            }
+        )
+        assert await surviving is None
+        assert client._pending_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_manager_restarts_crashed_client(self, tmp_path: Path, monkeypatch) -> None:
+        manager = HeadlessLSPManager.__new__(HeadlessLSPManager)
+        manager.workspace_root = tmp_path
+        manager._is_stopped = False
+        client = cast(Any, type("Client", (), {"server_name": "fake", "is_ready": False})())
+        client.restarted = False
+
+        async def start() -> bool:
+            client.restarted = True
+            client.is_ready = True
+            return True
+
+        client.start = start
+        manager._clients = [client]
+        monkeypatch.setattr(lsp_module, "_find_executable", lambda _: None)
+
+        await manager._init_clients()
+
+        assert client.restarted is True
+        assert manager.active_server_names == ["fake"]
+
+    @pytest.mark.asyncio
+    async def test_client_retains_document_buffer_and_exposes_semantic_requests(
+        self, tmp_path: Path
+    ) -> None:
+        client = HeadlessLSPClient("test", ["echo"], tmp_path)
+        uri = (tmp_path / "sample.py").as_uri()
+        client._proc = cast(Any, type("Process", (), {"returncode": None})())
+        client._is_ready = True
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+            if "id" in message:
+                client._dispatch_message(
+                    {"jsonrpc": "2.0", "id": message["id"], "result": {"uri": uri}}
+                )
+
+        client._send_message = send  # type: ignore[method-assign]
+        await client.notify_document(uri, "before save")
+        await client.notify_document(uri, "latest buffer")
+        result = await client.request_definition(uri, {"line": 2, "character": 4})
+
+        assert client._document_buffers[uri] == "latest buffer"
+        assert [message["method"] for message in sent] == [
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/definition",
+        ]
+        assert result == {"uri": uri}
+
+    @pytest.mark.asyncio
+    async def test_client_replays_open_documents_after_restart(self, tmp_path: Path) -> None:
+        client = HeadlessLSPClient("test", ["echo"], tmp_path)
+        uri = (tmp_path / "sample.py").as_uri()
+        client._document_buffers = {uri: "unsaved buffer"}
+        client._opened_docs = {uri: 4}
+        client._is_ready = True
+        client._proc = cast(Any, type("Process", (), {"returncode": None})())
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        client._send_message = send  # type: ignore[method-assign]
+        await client._replay_open_documents()
+
+        assert sent[0]["method"] == "textDocument/didOpen"
+        assert sent[0]["params"]["textDocument"]["text"] == "unsaved buffer"
+        assert client._opened_docs[uri] == 5
+
     def test_client_discards_diagnostics_for_older_document_version(self, tmp_path: Path) -> None:
         client = HeadlessLSPClient(
             server_name="test",

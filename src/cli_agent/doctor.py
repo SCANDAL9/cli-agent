@@ -23,14 +23,14 @@ async def run_diagnostics(
     """
     tp = token_provider or TokenProvider()
     mem = memory_store or MemoryStore()
-    cgs = code_graph_store or CodeGraphStore(db_path=mem.db_path)
+    cgs = code_graph_store or CodeGraphStore()
 
     results: dict[str, Any] = {
         "token_status": "unknown",
         "database_status": "unknown",
         "code_graph_status": "unknown",
         "workspace_key": resolve_project_key(),
-        "database_path": str(mem.db_path),
+        "database_path": str(mem.storage_engine.database_path),
         "issues": [],
     }
     results["native_accelerators"] = fast_tools.capability_summary()
@@ -48,14 +48,14 @@ async def run_diagnostics(
         results["token_status"] = "error"
         results["issues"].append(f"GCloud authentication failure: {e}")
 
-    # 2. Check SQLite Memory Store connectivity
+    # 2. Check persistent storage connectivity
     try:
         recent = mem.get_recent_memories(limit=1)
         results["database_status"] = "healthy"
         results["memories_count"] = len(recent)
     except Exception as e:
         results["database_status"] = "error"
-        results["issues"].append(f"SQLite database error: {e}")
+        results["issues"].append(f"Persistent storage error: {e}")
 
     # 3. Check Code Graph Store status
     try:

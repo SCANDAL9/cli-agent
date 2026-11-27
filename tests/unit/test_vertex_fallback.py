@@ -79,6 +79,83 @@ def test_tool_edit_snapshot_reads_only_authorized_text_targets(tmp_path):
 
     assert snapshot == (str(file_path), "value = 1\n")
     assert _capture_tool_edit_snapshot("read_file", {"path": str(file_path)}) is None
+    assert _capture_tool_edit_snapshot(
+        "apply_code_action",
+        {"path": str(file_path), "action_index": 0, "action_title": "Add import"},
+    ) == (str(file_path), "value = 1\n")
+    assert (
+        _capture_tool_edit_snapshot(
+            "apply_code_action", {"path": str(file_path), "line": 0, "character": 0}
+        )
+        is None
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_chat_blocks_unapproved_code_action_before_tool_execution(monkeypatch, tmp_path):
+    from cli_agent import vertex as vertex_module
+    from cli_agent.security import SecurityPolicy
+
+    file_path = tmp_path / "source.py"
+    file_path.write_text("value = 1\n", encoding="utf-8")
+    call_payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "apply_code_action",
+                                "args": {
+                                    "path": str(file_path),
+                                    "line": 0,
+                                    "character": 0,
+                                    "server_name": "pyright",
+                                    "action_index": 0,
+                                    "action_title": "Add import",
+                                    "selection_id": "f353c4e202ad12345fa0",
+                                },
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    final_payload = {"candidates": [{"content": {"parts": [{"text": "approval required"}]}}]}
+    responses = [call_payload, final_payload]
+    executed: list[str] = []
+
+    def handler(_request):
+        return httpx.Response(200, json=responses.pop(0))
+
+    def execute(name, _arguments):
+        executed.append(name)
+        file_path.write_text("unsafe = True\n", encoding="utf-8")
+        return {"status": "success"}
+
+    monkeypatch.setattr(vertex_module, "execute_tool", execute)
+    client = VertexAgentClient(
+        project_id="test-project",
+        model_name="gemini-3.8-flash",
+        token_provider=_MockFixedTokenProvider(),
+        security_policy=SecurityPolicy(auto_approve=False),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        output = await client.chat(
+            [{"role": "user", "parts": [{"text": "apply the selected fix"}]}],
+            tools_declarations=[],
+            max_turns=2,
+        )
+    finally:
+        await client._http_client.aclose()
+
+    assert output == "approval required"
+    assert executed == []
+    assert file_path.read_text(encoding="utf-8") == "value = 1\n"
 
 
 @pytest.mark.unit

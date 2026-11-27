@@ -123,6 +123,20 @@ def _find_executable(name: str) -> str | None:
     return None
 
 
+def _language_id(uri: str) -> str:
+    suffix = Path(uri.removeprefix("file://")).suffix.lower()
+    return {
+        ".py": "python",
+        ".rs": "rust",
+        ".go": "go",
+        ".zig": "zig",
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
+    }.get(suffix, "plaintext")
+
+
 class HeadlessLSPClient:
     """Manages a persistent, headless LSP server subprocess over stdio JSON-RPC 2.0."""
 
@@ -142,6 +156,7 @@ class HeadlessLSPClient:
         self._diagnostics_cache: dict[str, list[LSPDiagnostic]] = {}
         self._diagnostic_events: dict[str, asyncio.Event] = {}
         self._opened_docs: dict[str, int] = {}
+        self._document_buffers: dict[str, str] = {}
         self._is_ready = False
         self._lock = asyncio.Lock()
 
@@ -213,6 +228,7 @@ class HeadlessLSPClient:
             # Send initialized notification
             await self._send_message({"jsonrpc": "2.0", "method": "initialized", "params": {}})
             self._is_ready = True
+            await self._replay_open_documents()
             return True
 
     def _get_request_id(self) -> int:
@@ -237,6 +253,66 @@ class HeadlessLSPClient:
         except (BrokenPipeError, ConnectionResetError):
             self._is_ready = False
 
+    async def request(
+        self, method: str, params: dict[str, Any], timeout_sec: float = 1.0
+    ) -> Any | None:
+        """Send one LSP request and return its result, or None when unavailable."""
+        if not self.is_ready:
+            return None
+        request_id = self._get_request_id()
+        future = self._register_request(request_id)
+        try:
+            await self._send_message(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            )
+            response = await asyncio.wait_for(future, timeout=timeout_sec)
+        except (TimeoutError, ConnectionError):
+            self._pending_requests.pop(request_id, None)
+            return None
+        except asyncio.CancelledError:
+            pending = self._pending_requests.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+            raise
+        if "error" in response:
+            return None
+        return response.get("result")
+
+    async def request_definition(self, uri: str, position: dict[str, int]) -> Any | None:
+        return await self.request(
+            "textDocument/definition",
+            {"textDocument": {"uri": uri}, "position": position},
+        )
+
+    async def request_references(
+        self, uri: str, position: dict[str, int], include_declaration: bool = True
+    ) -> Any | None:
+        return await self.request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": uri},
+                "position": position,
+                "context": {"includeDeclaration": include_declaration},
+            },
+        )
+
+    async def request_code_actions(
+        self,
+        uri: str,
+        range_: dict[str, Any],
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.01,
+    ) -> Any | None:
+        return await self.request(
+            "textDocument/codeAction",
+            {
+                "textDocument": {"uri": uri},
+                "range": range_,
+                "context": {"diagnostics": diagnostics or []},
+            },
+            timeout_sec=timeout_sec,
+        )
+
     async def _stdout_reader_loop(self) -> None:
         """Reads framed JSON-RPC 2.0 messages from LSP stdout."""
         if not self._proc or not self._proc.stdout:
@@ -252,6 +328,7 @@ class HeadlessLSPClient:
                     if not line_bytes:
                         # EOF
                         self._is_ready = False
+                        self._fail_pending_requests()
                         return
                     line = line_bytes.decode("latin1").strip()
                     if not line:
@@ -274,11 +351,19 @@ class HeadlessLSPClient:
                 self._dispatch_message(data)
 
             except asyncio.IncompleteReadError:
+                self._is_ready = False
+                self._fail_pending_requests()
                 break
             except asyncio.CancelledError:
                 break
             except Exception:
                 continue
+
+    def _fail_pending_requests(self) -> None:
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.set_exception(ConnectionError("LSP server stopped"))
+        self._pending_requests.clear()
 
     def _dispatch_message(self, msg: dict[str, Any]) -> None:
         # 1. Response to pending request
@@ -358,6 +443,8 @@ class HeadlessLSPClient:
         if not self.is_ready:
             return
 
+        self._document_buffers[uri] = content
+
         # Invalidate any cached diagnostics from previous versions of this file
         self._diagnostics_cache.pop(uri, None)
         if uri not in self._diagnostic_events:
@@ -372,7 +459,7 @@ class HeadlessLSPClient:
                 "params": {
                     "textDocument": {
                         "uri": uri,
-                        "languageId": "python",
+                        "languageId": _language_id(uri),
                         "version": 1,
                         "text": content,
                     }
@@ -391,6 +478,28 @@ class HeadlessLSPClient:
                 },
             }
             await self._send_message(change_msg)
+
+    async def _replay_open_documents(self) -> None:
+        """Reopen unsaved buffers after initialization or a server restart."""
+        for uri, content in self._document_buffers.items():
+            version = self._opened_docs.get(uri, 0) + 1
+            self._opened_docs[uri] = version
+            self._diagnostics_cache.pop(uri, None)
+            self._diagnostic_events.setdefault(uri, asyncio.Event()).clear()
+            await self._send_message(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": _language_id(uri),
+                            "version": version,
+                            "text": content,
+                        }
+                    },
+                }
+            )
 
     async def wait_for_diagnostics(self, uri: str, timeout_sec: float) -> list[LSPDiagnostic]:
         """Awaits push diagnostics for a URI up to timeout_sec."""
@@ -523,34 +632,119 @@ class HeadlessLSPManager:
         loop.run_forever()
 
     async def _init_clients(self) -> None:
-        if self._clients or self._is_stopped:
+        if self._is_stopped:
+            return
+        # Keep existing warm clients and automatically restart crashed processes.
+        if self._clients:
+            for client in self._clients:
+                if not client.is_ready:
+                    await client.start()
             return
 
-        # 1. Discover ruff server
-        ruff_bin = _find_executable("ruff")
-        if ruff_bin:
+        server_commands = (
+            ("ruff", ("ruff",), ("server", "--preview")),
+            ("pyright", ("pyright-langserver", "basedpyright-langserver"), ("--stdio",)),
+            ("rust-analyzer", ("rust-analyzer",), ()),
+            ("gopls", ("gopls",), ("serve",)),
+            ("zls", ("zls",), ()),
+            ("typescript", ("typescript-language-server",), ("--stdio",)),
+        )
+        known_names = {client.server_name for client in self._clients}
+        for server_name, executables, arguments in server_commands:
+            if server_name in known_names:
+                continue
+            executable = next(
+                (path for name in executables if (path := _find_executable(name))), None
+            )
+            if executable is None:
+                continue
             client = HeadlessLSPClient(
-                server_name="ruff",
-                command=[ruff_bin, "server", "--preview"],
+                server_name=server_name,
+                command=[executable, *arguments],
                 workspace_root=self.workspace_root,
             )
-            started = await client.start()
-            if started:
+            if await client.start():
                 self._clients.append(client)
 
-        # 2. Discover pyright-langserver / basedpyright
-        pyright_bin = _find_executable("pyright-langserver") or _find_executable(
-            "basedpyright-langserver"
-        )
-        if pyright_bin:
-            client = HeadlessLSPClient(
-                server_name="pyright",
-                command=[pyright_bin, "--stdio"],
-                workspace_root=self.workspace_root,
+    async def request_semantic(
+        self,
+        method: str,
+        uri: str,
+        position: dict[str, int] | None = None,
+        *,
+        document_text: str | None = None,
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.01,
+    ) -> dict[str, Any]:
+        """Query active language servers for semantic requests at an explicit position."""
+        await self._init_clients()
+        params: dict[str, Any] = {"textDocument": {"uri": uri}}
+        if method in {"textDocument/definition", "textDocument/references"}:
+            if position is None:
+                return {}
+            params["position"] = position
+            if method == "textDocument/references":
+                params["context"] = {"includeDeclaration": True}
+        elif method == "textDocument/codeAction":
+            if position is None:
+                return {}
+            params.update(
+                {
+                    "range": {
+                        "start": position,
+                        "end": position,
+                    },
+                    "context": {"diagnostics": diagnostics or []},
+                }
             )
-            started = await client.start()
-            if started:
-                self._clients.append(client)
+        else:
+            return {}
+        ready_clients = [client for client in self._clients if client.is_ready]
+        if method == "textDocument/codeAction" and document_text is not None:
+            await asyncio.gather(
+                *(client.notify_document(uri, document_text) for client in ready_clients),
+                return_exceptions=True,
+            )
+        results = await asyncio.gather(
+            *(client.request(method, params, timeout_sec=timeout_sec) for client in ready_clients),
+            return_exceptions=True,
+        )
+        return {
+            client.server_name: result
+            for client, result in zip(ready_clients, results, strict=False)
+            if result is not None and not isinstance(result, BaseException)
+        }
+
+    def request_semantic_sync(
+        self,
+        method: str,
+        uri: str,
+        position: dict[str, int] | None = None,
+        *,
+        document_text: str | None = None,
+        diagnostics: list[dict[str, Any]] | None = None,
+        timeout_sec: float = 0.05,
+    ) -> dict[str, Any]:
+        """Runs semantic requests on the manager's LSP event loop for sync tools."""
+        self._ensure_loop_started()
+        if self._loop is None or not self._loop.is_running():
+            return {}
+        request = asyncio.run_coroutine_threadsafe(
+            self.request_semantic(
+                method,
+                uri,
+                position,
+                document_text=document_text,
+                diagnostics=diagnostics,
+                timeout_sec=timeout_sec,
+            ),
+            self._loop,
+        )
+        try:
+            return request.result(timeout=timeout_sec + 0.1)
+        except Exception:
+            request.cancel()
+            return {}
 
     @property
     def active_server_names(self) -> list[str]:

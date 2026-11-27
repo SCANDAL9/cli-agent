@@ -4,9 +4,12 @@ Enables file reading, directory exploration, code searching, and persistent SQLi
 """
 
 import contextvars
+import hashlib
+import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -449,6 +452,11 @@ async def hybrid_search_code(query: str, limit: int = 5) -> dict[str, Any]:
         return {"error": f"Failed executing hybrid code search: {str(e)}"}
 
 
+async def semantic_search_code(query: str, limit: int = 5) -> dict[str, Any]:
+    """Searches code intent with the local dense-and-sparse hybrid index."""
+    return await hybrid_search_code(query, limit)
+
+
 def save_memory(
     title: str,
     content: str,
@@ -712,6 +720,344 @@ def analyze_symbol_impact(symbol_name: str) -> dict[str, Any]:
         return {"error": f"Failed analyzing symbol impact: {str(e)}"}
 
 
+def _validate_graph_query(symbol_name: str, max_depth: int) -> str | None:
+    if not isinstance(symbol_name, str) or not symbol_name.strip():
+        return "symbol_name must be a non-empty string."
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or not 1 <= max_depth <= 5:
+        return "max_depth must be an integer between 1 and 5."
+    return None
+
+
+def get_symbol_call_tree(symbol_name: str, max_depth: int = 3) -> dict[str, Any]:
+    """Returns bounded upstream callers and downstream callees for a symbol."""
+    error = _validate_graph_query(symbol_name, max_depth)
+    if error:
+        return {"error": error}
+    try:
+        project_key = resolve_project_key()
+        return code_graph_store.get_symbol_call_tree(project_key, symbol_name.strip(), max_depth)
+    except Exception as e:
+        return {"error": f"Failed tracing symbol call tree: {str(e)}"}
+
+
+def get_type_hierarchy(symbol_name: str, max_depth: int = 3) -> dict[str, Any]:
+    """Returns bounded base types and derived implementations for a symbol."""
+    error = _validate_graph_query(symbol_name, max_depth)
+    if error:
+        return {"error": error}
+    try:
+        project_key = resolve_project_key()
+        return code_graph_store.get_type_hierarchy(project_key, symbol_name.strip(), max_depth)
+    except Exception as e:
+        return {"error": f"Failed querying type hierarchy: {str(e)}"}
+
+
+def _lsp_diagnostic_context(report: Any) -> list[dict[str, Any]]:
+    severity_map = {"ERROR": 1, "WARNING": 2, "INFO": 3, "HINT": 4}
+    diagnostics: list[dict[str, Any]] = []
+    for item in getattr(report, "diagnostics", [])[:100]:
+        diagnostics.append(
+            {
+                "range": {
+                    "start": {
+                        "line": max(0, item.line - 1),
+                        "character": max(0, item.column - 1),
+                    },
+                    "end": {
+                        "line": max(0, item.end_line - 1),
+                        "character": max(0, item.end_column - 1),
+                    },
+                },
+                "severity": severity_map.get(getattr(item.severity, "value", ""), 1),
+                "code": item.code or None,
+                "source": item.source,
+                "message": item.message,
+            }
+        )
+    return diagnostics
+
+
+def _lsp_position_offset(text: str, position: dict[str, Any]) -> int:
+    line = position.get("line")
+    character = position.get("character")
+    if (
+        isinstance(line, bool)
+        or not isinstance(line, int)
+        or line < 0
+        or isinstance(character, bool)
+        or not isinstance(character, int)
+        or character < 0
+    ):
+        raise ValueError(
+            "LSP edit positions must use non-negative integer line and character values."
+        )
+
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        lines = [""]
+    if text.endswith(("\n", "\r")):
+        lines.append("")
+    if line >= len(lines):
+        raise ValueError("LSP edit line is outside the current document.")
+
+    offset = sum(len(part) for part in lines[:line])
+    line_text = lines[line].rstrip("\r\n")
+    units = 0
+    for index, value in enumerate(line_text):
+        if units == character:
+            return offset + index
+        units += 2 if ord(value) > 0xFFFF else 1
+        if units > character:
+            raise ValueError("LSP edit position splits a UTF-16 surrogate pair.")
+    if units == character:
+        return offset + len(line_text)
+    raise ValueError("LSP edit character is outside the current line.")
+
+
+def _extract_code_action_edits(
+    workspace_edit: Any, target_uri: str
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if not isinstance(workspace_edit, dict):
+        return None, "The selected action does not contain a workspace text edit."
+    if "changes" in workspace_edit and "documentChanges" in workspace_edit:
+        return None, "Workspace edits containing both changes formats are ambiguous."
+
+    edits: list[dict[str, Any]] = []
+    changes = workspace_edit.get("changes")
+    if changes is not None:
+        if not isinstance(changes, dict) or set(changes) != {target_uri}:
+            return None, "Workspace edits may only modify the selected file."
+        candidate_edits = changes.get(target_uri)
+        if not isinstance(candidate_edits, list):
+            return None, "Workspace edits contain an invalid text edit list."
+        edits.extend(candidate_edits)
+    else:
+        document_changes = workspace_edit.get("documentChanges")
+        if not isinstance(document_changes, list) or not document_changes:
+            return None, "The selected action does not contain a workspace text edit."
+        for change in document_changes:
+            if not isinstance(change, dict) or "textDocument" not in change:
+                return None, "Resource operations and command-only actions are not supported."
+            text_document = change.get("textDocument")
+            if not isinstance(text_document, dict) or text_document.get("uri") != target_uri:
+                return None, "Workspace edits may only modify the selected file."
+            candidate_edits = change.get("edits")
+            if not isinstance(candidate_edits, list):
+                return None, "Workspace edits contain an invalid text edit list."
+            edits.extend(candidate_edits)
+
+    if not edits or not all(isinstance(edit, dict) for edit in edits):
+        return None, "The selected action contains no valid text edits."
+    return edits, None
+
+
+def _code_action_selection_id(server_name: str, action: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"server_name": server_name, "action": action},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:20]
+
+
+def apply_code_action(
+    path: str,
+    line: int,
+    character: int,
+    server_name: str | None = None,
+    action_index: int | None = None,
+    action_title: str | None = None,
+    selection_id: str | None = None,
+) -> dict[str, Any]:
+    """Lists LSP fixes or applies one explicitly selected, validated text edit."""
+    try:
+        if (
+            isinstance(line, bool)
+            or not isinstance(line, int)
+            or line < 0
+            or isinstance(character, bool)
+            or not isinstance(character, int)
+            or character < 0
+        ):
+            return {"error": "line and character must be non-negative integers."}
+        selecting = any(
+            value is not None for value in (server_name, action_index, action_title, selection_id)
+        )
+        if selecting and (
+            not isinstance(server_name, str)
+            or not server_name.strip()
+            or isinstance(action_index, bool)
+            or not isinstance(action_index, int)
+            or action_index < 0
+            or not isinstance(action_title, str)
+            or not action_title.strip()
+            or not isinstance(selection_id, str)
+            or not selection_id.strip()
+        ):
+            return {
+                "error": "server_name, action_index, action_title, and selection_id must be supplied together."
+            }
+
+        resolved = _resolve_tool_path(path)
+        if not resolved.is_file():
+            return {"error": f"Path '{path}' is not an existing file."}
+        sandbox = get_active_sandbox()
+        if sandbox is not None:
+            try:
+                resolved.relative_to(sandbox.resolve())
+            except ValueError:
+                return {"error": "Access denied: code actions must stay inside the active sandbox."}
+
+        from .lsp import get_lsp_manager
+
+        manager = get_lsp_manager()
+        workspace_root = Path(manager.workspace_root).resolve()
+        try:
+            resolved.relative_to(workspace_root)
+        except ValueError:
+            return {"error": "Code actions must stay inside the active LSP workspace."}
+
+        if selecting:
+            write_error = _check_write_allowed(resolved)
+            if write_error:
+                return {"error": write_error}
+            _enforce_write_scope(path, resolved)
+
+        with resolved.open("r", encoding="utf-8", newline="") as source_file:
+            original = source_file.read()
+        report = manager.check_file_sync(resolved, original, timeout_ms=50.0)
+        uri = resolved.as_uri()
+        position = {"line": line, "character": character}
+        server_results = manager.request_semantic_sync(
+            "textDocument/codeAction",
+            uri,
+            position,
+            document_text=original,
+            diagnostics=_lsp_diagnostic_context(report),
+            timeout_sec=0.05,
+        )
+
+        actions_by_server: dict[str, list[dict[str, Any]]] = {}
+        available: list[dict[str, Any]] = []
+        if isinstance(server_results, dict):
+            for current_server, server_actions in sorted(server_results.items()):
+                if not isinstance(current_server, str) or not isinstance(server_actions, list):
+                    continue
+                valid_actions = [item for item in server_actions if isinstance(item, dict)]
+                actions_by_server[current_server] = valid_actions
+                for index, action in enumerate(valid_actions):
+                    available.append(
+                        {
+                            "server_name": current_server,
+                            "action_index": index,
+                            "title": action.get("title")
+                            if isinstance(action.get("title"), str)
+                            else "(untitled action)",
+                            "kind": action.get("kind")
+                            if isinstance(action.get("kind"), str)
+                            else None,
+                            "selection_id": _code_action_selection_id(current_server, action),
+                        }
+                    )
+
+        if not selecting:
+            return {
+                "status": "available" if available else "no_actions",
+                "path": str(resolved),
+                "position": position,
+                "actions": available,
+            }
+
+        action_list = actions_by_server.get(server_name or "", [])
+        if action_index is None or action_index >= len(action_list):
+            return {
+                "error": "The selected LSP action is no longer available; no source was changed."
+            }
+        selected = action_list[action_index]
+        if selected.get("title") != action_title:
+            return {"error": "The selected LSP action changed; no source was changed."}
+        if _code_action_selection_id(server_name or "", selected) != selection_id:
+            return {"error": "The selected LSP action changed; no source was changed."}
+        if selected.get("command"):
+            return {
+                "error": "Command-only or command-bearing LSP actions are not supported; no source was changed."
+            }
+
+        text_edits, edit_error = _extract_code_action_edits(selected.get("edit"), uri)
+        if edit_error:
+            return {"error": f"{edit_error} No source was changed."}
+        assert text_edits is not None
+
+        resolved_edits: list[tuple[int, int, str]] = []
+        for text_edit in text_edits:
+            edit_range = text_edit.get("range")
+            new_text = text_edit.get("newText")
+            if (
+                not isinstance(edit_range, dict)
+                or not isinstance(new_text, str)
+                or not isinstance(edit_range.get("start"), dict)
+                or not isinstance(edit_range.get("end"), dict)
+            ):
+                return {"error": "The selected workspace edit is malformed; no source was changed."}
+            start = _lsp_position_offset(original, edit_range["start"])
+            end = _lsp_position_offset(original, edit_range["end"])
+            if start > end:
+                return {
+                    "error": "The selected workspace edit has a reversed range; no source was changed."
+                }
+            resolved_edits.append((start, end, new_text))
+
+        ascending_edits = sorted(resolved_edits)
+        if any(
+            current[0] < previous[1] or current[0] == previous[0]
+            for previous, current in zip(ascending_edits, ascending_edits[1:], strict=False)
+        ):
+            return {
+                "error": "Overlapping workspace edits are not supported; no source was changed."
+            }
+        updated = original
+        for start, end, new_text in reversed(ascending_edits):
+            updated = updated[:start] + new_text + updated[end:]
+
+        with resolved.open("r", encoding="utf-8", newline="") as source_file:
+            if source_file.read() != original:
+                return {
+                    "error": "The selected file changed while resolving the action; no source was changed."
+                }
+        file_mode = stat.S_IMODE(resolved.stat().st_mode)
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{resolved.name}.", dir=resolved.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as temp_file:
+                temp_file.write(updated)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.chmod(temp_name, file_mode)
+            os.replace(temp_name, resolved)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+        if resolved.suffix in SUPPORTED_EXTENSIONS:
+            try:
+                code_graph_indexer.index_file(resolved)
+            except Exception:
+                pass
+        return {
+            "status": "success",
+            "path": str(resolved),
+            "action_title": action_title,
+            "edits_applied": len(text_edits),
+        }
+    except ToolScopeViolationError as e:
+        return e.to_dict()
+    except Exception as e:
+        return {"error": f"Failed applying LSP code action: {str(e)}"}
+
+
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"(Bearer\s+)[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
@@ -971,6 +1317,10 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "lsp_workspace_diagnostics": lsp_workspace_diagnostics,
     "ast_grep_replace": ast_grep_replace,
     "hybrid_search_code": hybrid_search_code,
+    "semantic_search_code": semantic_search_code,
+    "get_symbol_call_tree": get_symbol_call_tree,
+    "get_type_hierarchy": get_type_hierarchy,
+    "apply_code_action": apply_code_action,
     "save_memory": save_memory,
     "search_memory": search_memory,
     "write_file": write_file,
@@ -1122,6 +1472,95 @@ GEMINI_TOOLS_DECLARATIONS = [
                 },
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "semantic_search_code",
+        "description": "Searches code by intent using local dense embeddings and sparse keyword retrieval; returns the best matching code chunks.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {
+                    "type": "STRING",
+                    "description": "Natural-language description of code behavior to find.",
+                },
+                "limit": {"type": "INTEGER", "description": "Maximum result count (default: 5)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_symbol_call_tree",
+        "description": "Traces bounded upstream callers and downstream callees for an indexed symbol across files.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "symbol_name": {
+                    "type": "STRING",
+                    "description": "Function, method, or symbol to trace.",
+                },
+                "max_depth": {
+                    "type": "INTEGER",
+                    "description": "Traversal depth from 1 to 5 (default: 3).",
+                },
+            },
+            "required": ["symbol_name"],
+        },
+    },
+    {
+        "name": "get_type_hierarchy",
+        "description": "Inspects indexed base classes and derived implementations for a type.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "symbol_name": {
+                    "type": "STRING",
+                    "description": "Class or type whose inheritance hierarchy to inspect.",
+                },
+                "max_depth": {
+                    "type": "INTEGER",
+                    "description": "Traversal depth from 1 to 5 (default: 3).",
+                },
+            },
+            "required": ["symbol_name"],
+        },
+    },
+    {
+        "name": "apply_code_action",
+        "description": "Lists LSP fixes at a zero-based file position. To apply one, call again with its server_name, action_index, exact action_title, and selection_id; only validated text edits to that file are applied, never server commands or multi-file/resource operations.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {
+                    "type": "STRING",
+                    "description": "Workspace file to inspect and optionally update.",
+                },
+                "line": {
+                    "type": "INTEGER",
+                    "description": "Zero-based line containing the code action.",
+                },
+                "character": {
+                    "type": "INTEGER",
+                    "description": "Zero-based UTF-16 character position containing the code action.",
+                },
+                "server_name": {
+                    "type": "STRING",
+                    "description": "Server name returned by the listing call; required to apply.",
+                },
+                "action_index": {
+                    "type": "INTEGER",
+                    "description": "Action index returned by the listing call; required to apply.",
+                },
+                "action_title": {
+                    "type": "STRING",
+                    "description": "Exact action title returned by the listing call; required to apply.",
+                },
+                "selection_id": {
+                    "type": "STRING",
+                    "description": "Exact selection_id returned by the listing call; binds the action contents to the explicit choice.",
+                },
+            },
+            "required": ["path", "line", "character"],
         },
     },
     {
@@ -1305,7 +1744,10 @@ GEMINI_TOOLS_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "command": {"type": "STRING", "description": "Shell command to run in the background."},
+                "command": {
+                    "type": "STRING",
+                    "description": "Shell command to run in the background.",
+                },
                 "cwd": {"type": "STRING", "description": "Optional working directory."},
             },
             "required": ["command"],
@@ -1317,8 +1759,14 @@ GEMINI_TOOLS_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "job_id": {"type": "STRING", "description": "Background job ID returned by start_background_process."},
-                "tail_lines": {"type": "INTEGER", "description": "Number of recent log lines to fetch (default: 100)."},
+                "job_id": {
+                    "type": "STRING",
+                    "description": "Background job ID returned by start_background_process.",
+                },
+                "tail_lines": {
+                    "type": "INTEGER",
+                    "description": "Number of recent log lines to fetch (default: 100).",
+                },
             },
             "required": ["job_id"],
         },

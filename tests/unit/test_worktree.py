@@ -220,11 +220,13 @@ class TestWorktreeManagerCleanupAll:
 @pytest.mark.unit
 class TestSandboxToolRedirection:
     def test_tools_operate_inside_sandbox_when_active(
-        self, temp_git_repo: Path, tmp_path: Path
+        self, temp_git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         manager = WorktreeManager(base_dir=tmp_path / "worktrees_tools")
         session = manager.create_session(repo_path=temp_git_repo)
 
+        # Keep tmp_path outside the current directory so absolute-path redirection is unambiguous.
+        monkeypatch.chdir(temp_git_repo)
         set_active_sandbox(session.worktree_dir)
         assert get_active_sandbox() == session.worktree_dir
 

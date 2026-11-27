@@ -175,6 +175,9 @@ class StorageConnection:
 class StorageEngine(Protocol):
     """Common storage interface used by memory, session, graph, and search stores."""
 
+    fts_dialect: str
+    migration_transaction_sql: str
+
     @property
     def database_path(self) -> Path | str: ...
 
@@ -197,6 +200,15 @@ class StorageEngine(Protocol):
         content_table: str | None = None,
         content_rowid: str | None = None,
     ) -> None: ...
+
+    def fts_table_statement(
+        self,
+        table_name: str,
+        columns: Sequence[str],
+        *,
+        content_table: str | None = None,
+        content_rowid: str | None = None,
+    ) -> str: ...
 
     def close(self) -> None: ...
 

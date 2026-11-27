@@ -9,7 +9,7 @@ from .factory import (
 )
 from .migration import MigrationReport, StorageMigrationConflict, migrate_legacy_database
 from .sqlite import SQLiteEngine
-from .turso import TursoEngine
+from .turso import TursoEngine, TursoLocalEngine
 
 __all__ = [
     "MigrationReport",
@@ -20,6 +20,7 @@ __all__ = [
     "StorageMigrationConflict",
     "StorageRow",
     "TursoEngine",
+    "TursoLocalEngine",
     "clear_storage_engine_cache",
     "create_storage_engine",
     "get_storage_engine",

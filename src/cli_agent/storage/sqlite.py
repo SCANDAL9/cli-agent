@@ -8,12 +8,22 @@ from pathlib import Path
 from typing import Any
 
 from .base import StorageConnection, quote_identifier
+from .synchronous import configure_synchronous, normalize_synchronous_mode
 
 
 class SQLiteEngine:
-    def __init__(self, database_path: Path | str, busy_timeout_ms: int = 30_000) -> None:
+    fts_dialect = "fts5"
+    migration_transaction_sql = "BEGIN IMMEDIATE"
+
+    def __init__(
+        self,
+        database_path: Path | str,
+        busy_timeout_ms: int = 30_000,
+        synchronous: str = "FULL",
+    ) -> None:
         self.database_path = Path(database_path).expanduser()
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+        self.synchronous = normalize_synchronous_mode(synchronous)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -29,6 +39,7 @@ class SQLiteEngine:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA journal_mode = WAL")
+        configure_synchronous(connection, self.synchronous)
         return StorageConnection(connection)
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -56,13 +67,28 @@ class SQLiteEngine:
         content_table: str | None = None,
         content_rowid: str | None = None,
     ) -> None:
-        statement = self._fts_statement(
+        statement = self.fts_table_statement(
             table_name,
             columns,
             content_table=content_table,
             content_rowid=content_rowid,
         )
         self.execute(statement)
+
+    def fts_table_statement(
+        self,
+        table_name: str,
+        columns: Sequence[str],
+        *,
+        content_table: str | None = None,
+        content_rowid: str | None = None,
+    ) -> str:
+        return self._fts_statement(
+            table_name,
+            columns,
+            content_table=content_table,
+            content_rowid=content_rowid,
+        )
 
     @staticmethod
     def _fts_statement(

@@ -54,6 +54,27 @@ def _primary_key(source: sqlite3.Connection, table_name: str) -> list[str]:
     return [str(row[1]) for row in sorted(rows, key=lambda row: int(row[5])) if int(row[5])]
 
 
+def _legacy_fts_definition(
+    source: sqlite3.Connection,
+    table_name: str,
+    statement: str,
+) -> tuple[list[str], str, str]:
+    if not re.search(r"\bUSING\s+fts5\s*\(", statement, re.I):
+        raise StorageMigrationConflict(
+            f"Unsupported legacy full-text index '{table_name}'; source data was not modified."
+        )
+    content = re.search(r"\bcontent\s*=\s*(['\"])(.*?)\1", statement, re.I)
+    if content is None or not content.group(2):
+        raise StorageMigrationConflict(
+            f"Legacy full-text index '{table_name}' has no rebuildable content table."
+        )
+    content_rowid = re.search(r"\bcontent_rowid\s*=\s*(['\"])(.*?)\1", statement, re.I)
+    columns = _columns(source, table_name)
+    if not columns:
+        raise StorageMigrationConflict(f"Legacy full-text index '{table_name}' has no columns.")
+    return columns, content.group(2), content_rowid.group(2) if content_rowid else "rowid"
+
+
 def _validate_target_schema(source: sqlite3.Connection, destination: Any, table_name: str) -> None:
     quoted_table = quote_identifier(table_name)
     source_columns = source.execute(f"PRAGMA table_xinfo({quoted_table})").fetchall()
@@ -128,6 +149,13 @@ def migrate_legacy_database(source_path: Path | str, engine: StorageEngine) -> M
         table_objects = [row for row in objects if row[0] == "table"]
         other_objects = [row for row in objects if row[0] != "table"]
         user_tables = [str(row[1]) for row in table_objects if kinds.get(str(row[1])) != "shadow"]
+        native_fts = getattr(engine, "fts_dialect", "fts5") == "turso"
+        fts_indexes: dict[str, tuple[list[str], str, str]] = {}
+        if native_fts:
+            for row in table_objects:
+                name, statement = str(row[1]), str(row[2])
+                if kinds.get(name) == "virtual":
+                    fts_indexes[name] = _legacy_fts_definition(source, name, statement)
 
         with engine.connect() as destination:
             destination.execute(
@@ -141,10 +169,10 @@ def migrate_legacy_database(source_path: Path | str, engine: StorageEngine) -> M
             if marker:
                 return MigrationReport(already_migrated=True, copied_tables=tuple(user_tables))
 
-            destination.execute("BEGIN IMMEDIATE")
+            destination.execute(getattr(engine, "migration_transaction_sql", "BEGIN IMMEDIATE"))
             for row in table_objects:
                 name, statement = str(row[1]), str(row[2])
-                if kinds.get(name) == "shadow":
+                if kinds.get(name) == "shadow" or name in fts_indexes:
                     continue
                 destination.execute(_with_if_not_exists(statement, "TABLE"))
                 _validate_target_schema(source, destination, name)
@@ -154,12 +182,34 @@ def migrate_legacy_database(source_path: Path | str, engine: StorageEngine) -> M
                 kind = kinds.get(table_name, "table")
                 row = next(row for row in table_objects if row[1] == table_name)
                 statement = str(row[2])
+                if table_name in fts_indexes:
+                    continue
                 if kind == "virtual" and "content=" in statement.lower():
                     continue
                 copied_rows += _copy_table_rows(source, destination, table_name)
 
             for row in other_objects:
                 kind, statement = str(row[0]), str(row[2])
+                if (
+                    native_fts
+                    and kind == "trigger"
+                    and any(
+                        re.search(rf"\b{re.escape(name)}\b", statement, re.I)
+                        for name in fts_indexes
+                    )
+                ):
+                    continue
+                if (
+                    native_fts
+                    and kind == "view"
+                    and any(
+                        re.search(rf"\b{re.escape(name)}\b", statement, re.I)
+                        for name in fts_indexes
+                    )
+                ):
+                    raise StorageMigrationConflict(
+                        "A legacy view depends on an FTS5 virtual table and cannot be translated safely."
+                    )
                 if kind == "index":
                     statement = _with_if_not_exists(statement, "INDEX")
                 elif kind == "trigger":
@@ -168,11 +218,22 @@ def migrate_legacy_database(source_path: Path | str, engine: StorageEngine) -> M
                     statement = _with_if_not_exists(statement, "VIEW")
                 destination.execute(statement)
 
-            for row in table_objects:
-                name, statement = str(row[1]), str(row[2])
-                if kinds.get(name) == "virtual" and "content=" in statement.lower():
-                    quoted = quote_identifier(name)
-                    destination.execute(f"INSERT INTO {quoted}({quoted}) VALUES ('rebuild')")
+            for name, (columns, content_table, content_rowid) in fts_indexes.items():
+                destination.execute(
+                    engine.fts_table_statement(
+                        name,
+                        columns,
+                        content_table=content_table,
+                        content_rowid=content_rowid,
+                    )
+                )
+
+            if not native_fts:
+                for row in table_objects:
+                    name, statement = str(row[1]), str(row[2])
+                    if kinds.get(name) == "virtual" and "content=" in statement.lower():
+                        quoted = quote_identifier(name)
+                        destination.execute(f"INSERT INTO {quoted}({quoted}) VALUES ('rebuild')")
 
             destination.execute(
                 "INSERT INTO __cli_agent_storage_migrations (migration_id, source_path) VALUES (?, ?)",

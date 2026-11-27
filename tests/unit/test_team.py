@@ -47,6 +47,19 @@ class TestAgentRoleMatrix:
         assert "write_file" not in qa_tools
         assert "edit_file" not in qa_tools
 
+    def test_code_intelligence_tools_follow_role_permissions(self) -> None:
+        read_only_tools = {
+            "semantic_search_code",
+            "get_symbol_call_tree",
+            "get_type_hierarchy",
+        }
+        for role in (AgentRole.ARCHITECT, AgentRole.WORKER, AgentRole.QA):
+            assert read_only_tools <= ROLE_ALLOWED_TOOLS[role]
+
+        assert "apply_code_action" in ROLE_ALLOWED_TOOLS[AgentRole.WORKER]
+        assert "apply_code_action" not in ROLE_ALLOWED_TOOLS[AgentRole.ARCHITECT]
+        assert "apply_code_action" not in ROLE_ALLOWED_TOOLS[AgentRole.QA]
+
 
 @pytest.mark.unit
 @pytest.mark.asyncio

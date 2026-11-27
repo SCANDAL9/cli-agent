@@ -50,9 +50,12 @@ ROLE_ALLOWED_TOOLS: dict[AgentRole, set[str]] = {
         "lsp_workspace_diagnostics",
         "ast_grep_replace",
         "hybrid_search_code",
+        "semantic_search_code",
         "get_symbol_outline",
         "find_symbol_definition",
         "find_symbol_references",
+        "get_symbol_call_tree",
+        "get_type_hierarchy",
         "search_memory",
         "save_memory",
         "delegate_task",
@@ -64,10 +67,15 @@ ROLE_ALLOWED_TOOLS: dict[AgentRole, set[str]] = {
         "lsp_workspace_diagnostics",
         "ast_grep_replace",
         "hybrid_search_code",
+        "semantic_search_code",
         "get_symbol_outline",
         "find_symbol_definition",
+        "find_symbol_references",
+        "get_symbol_call_tree",
+        "get_type_hierarchy",
         "write_file",
         "edit_file",
+        "apply_code_action",
     },
     AgentRole.QA: {
         "read_file",
@@ -76,6 +84,12 @@ ROLE_ALLOWED_TOOLS: dict[AgentRole, set[str]] = {
         "lsp_workspace_diagnostics",
         "ast_grep_replace",
         "hybrid_search_code",
+        "semantic_search_code",
+        "get_symbol_outline",
+        "find_symbol_definition",
+        "find_symbol_references",
+        "get_symbol_call_tree",
+        "get_type_hierarchy",
         "run_command",
     },
 }
@@ -669,7 +683,9 @@ class MultiAgentTeam:
 
             if is_pass:
                 if on_event:
-                    on_event("qa_pass", f"Round {round_idx}: QA verified all tests passed successfully!")
+                    on_event(
+                        "qa_pass", f"Round {round_idx}: QA verified all tests passed successfully!"
+                    )
                 break
 
             if round_idx < max_feedback_rounds:
@@ -688,7 +704,15 @@ class MultiAgentTeam:
         if on_event:
             on_event("stage", "Phase 4: Synthesis & Final Review")
 
-        overall_status = "success" if (qa_result and qa_result.status == "success" and "FAIL" not in (qa_result.summary or "").upper()) else "failed"
+        overall_status = (
+            "success"
+            if (
+                qa_result
+                and qa_result.status == "success"
+                and "FAIL" not in (qa_result.summary or "").upper()
+            )
+            else "failed"
+        )
         last_worker = all_worker_results[-1] if all_worker_results else None
         final_summary = (
             f"### Multi-Agent Swarm Outcome ({overall_status.upper()})\n\n"

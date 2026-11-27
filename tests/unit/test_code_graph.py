@@ -2,16 +2,24 @@
 Unit tests for the Tree-sitter AST & Code Intelligence Graph module.
 """
 
+import os
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from cli_agent import code_graph, config
 from cli_agent.code_graph import (
     CodeGraphIndexer,
     CodeGraphStore,
     CodeSymbol,
     SymbolEdge,
 )
+from cli_agent.config import StorageConfig
+from cli_agent.storage.base import StorageConnection
+from cli_agent.storage.factory import clear_storage_engine_cache, create_storage_engine
+from cli_agent.storage.sqlite import SQLiteEngine
+from cli_agent.storage.turso import TursoLocalEngine
 from cli_agent.tools import (
     analyze_symbol_impact,
     find_symbol_definition,
@@ -34,6 +42,379 @@ def temp_indexer(temp_graph_store: CodeGraphStore) -> CodeGraphIndexer:
 
 @pytest.mark.unit
 class TestCodeGraphStore:
+    def test_default_graph_uses_isolated_normal_turso_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        legacy_path = tmp_path / "memory.db"
+        graph_path = tmp_path / "code_graph.db"
+        app_replica_path = tmp_path / "memory.turso.db"
+        legacy = SQLiteEngine(legacy_path)
+        legacy.execute("CREATE TABLE durable_marker (id INTEGER PRIMARY KEY, value TEXT)")
+        legacy.execute("INSERT INTO durable_marker (value) VALUES (?)", ("preserve",))
+        legacy.close()
+
+        monkeypatch.setattr(code_graph, "DEFAULT_DB_PATH", legacy_path)
+        monkeypatch.setattr(code_graph, "DEFAULT_CODE_GRAPH_DB_PATH", graph_path, raising=False)
+        monkeypatch.setattr(config, "DEFAULT_CONFIG_FILE", tmp_path / "missing-config.toml")
+        monkeypatch.setenv("CLI_AGENT_STORAGE_BACKEND", "turso")
+        monkeypatch.setenv("TURSO_MODE", "replica")
+        monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+        monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("TURSO_REPLICA_PATH", raising=False)
+
+        app_engine = create_storage_engine(
+            legacy_path,
+            StorageConfig(backend="turso", replica_path=app_replica_path),
+        )
+        graph_store = CodeGraphStore()
+        try:
+            assert graph_store.db_path == graph_path
+            assert graph_store.storage_engine.local_database_path == graph_path
+
+            with graph_store._get_connection() as connection:
+                graph_sync = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+                copied_tables = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'durable_marker'"
+                ).fetchall()
+            with app_engine.connect() as connection:
+                app_sync = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+                app_rows = connection.execute("SELECT value FROM durable_marker").fetchall()
+
+            assert graph_sync == 1
+            assert copied_tables == []
+            assert app_sync == 2
+            assert [row["value"] for row in app_rows] == ["preserve"]
+        finally:
+            app_engine.close()
+            clear_storage_engine_cache()
+
+    def test_normal_graph_reindexes_changed_source_after_restart(self, tmp_path: Path) -> None:
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        source_file = source_dir / "sample.py"
+        source_file.write_text("def before_restart():\n    return 1\n", encoding="utf-8")
+        graph_path = tmp_path / "code_graph.db"
+        graph_config = StorageConfig(
+            backend="turso",
+            replica_path=graph_path,
+            synchronous="NORMAL",
+        )
+
+        first_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        first_indexer = CodeGraphIndexer(first_store)
+        assert first_indexer.index_directory(source_dir, project_key="restart") == 1
+        clear_storage_engine_cache()
+
+        previous_mtime = source_file.stat().st_mtime
+        source_file.write_text("def after_restart():\n    return 2\n", encoding="utf-8")
+        os.utime(source_file, (previous_mtime + 2.0, previous_mtime + 2.0))
+
+        reopened_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        reopened_indexer = CodeGraphIndexer(reopened_store)
+        assert reopened_indexer.index_directory(source_dir, project_key="restart") == 1
+        assert reopened_store.find_definition("restart", "before_restart") == []
+        assert reopened_store.find_definition("restart", "after_restart")
+        clear_storage_engine_cache()
+
+    def test_normal_graph_prunes_sources_deleted_while_offline(self, tmp_path: Path) -> None:
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        deleted_source = source_dir / "deleted.py"
+        deleted_source.write_text("def removed_after_restart():\n    return 1\n", encoding="utf-8")
+        other_root = tmp_path / "outside-project-root"
+        other_root.mkdir()
+        other_source = other_root / "kept.py"
+        other_source.write_text(
+            "def kept_outside_scanned_root():\n    return 2\n", encoding="utf-8"
+        )
+        graph_path = tmp_path / "code_graph.db"
+        graph_config = StorageConfig(
+            backend="turso",
+            replica_path=graph_path,
+            synchronous="NORMAL",
+        )
+
+        first_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        first_indexer = CodeGraphIndexer(first_store)
+        assert first_indexer.index_directory(source_dir, project_key="restart") == 1
+        assert first_indexer.index_directory(other_root, project_key="restart") == 1
+        clear_storage_engine_cache()
+        deleted_source.unlink()
+
+        reopened_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        reopened_indexer = CodeGraphIndexer(reopened_store)
+        try:
+            assert (
+                reopened_indexer.index_directory(source_dir, project_key="restart", max_files=None)
+                == 0
+            )
+            assert reopened_store.find_definition("restart", "removed_after_restart") == []
+            assert reopened_store.find_definition("restart", "kept_outside_scanned_root")
+        finally:
+            clear_storage_engine_cache()
+
+    def test_index_directory_preserves_other_roots_and_uses_atomic_cleanup(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_symbol(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="safe-prune") == 1
+        source.unlink()
+
+        with temp_graph_store._get_connection() as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_metadata_prune
+                BEFORE DELETE ON file_metadata
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced cleanup failure');
+                END
+                """
+            )
+
+        with pytest.raises(sqlite3.DatabaseError, match="forced cleanup failure"):
+            temp_indexer.index_directory(root, project_key="safe-prune")
+        assert temp_graph_store.find_definition("safe-prune", "cached_symbol")
+
+        other_root = tmp_path / "other-root"
+        other_root.mkdir()
+        other_source = other_root / "other.py"
+        other_source.write_text("def outside_scanned_root(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(other_root, project_key="safe-prune") == 1
+
+        with temp_graph_store._get_connection() as connection:
+            connection.execute("DROP TRIGGER reject_metadata_prune")
+        assert temp_indexer.index_directory(root, project_key="safe-prune") == 0
+        assert temp_graph_store.find_definition("safe-prune", "cached_symbol") == []
+        assert temp_graph_store.find_definition("safe-prune", "outside_scanned_root")
+
+    def test_index_directory_does_not_prune_on_incomplete_walk(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "incomplete-project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_after_scan_error(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="incomplete") == 1
+        source.unlink()
+
+        def incomplete_walk(_root: Path, *, onerror=None):
+            if onerror is not None:
+                onerror(PermissionError("unreadable subtree"))
+            return iter(())
+
+        monkeypatch.setattr(code_graph.os, "walk", incomplete_walk)
+        assert temp_indexer.index_directory(root, project_key="incomplete") == 0
+        assert temp_graph_store.find_definition("incomplete", "cached_after_scan_error")
+
+    def test_index_directory_does_not_prune_after_max_files_early_return(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "limited-project"
+        root.mkdir()
+        stale_source = root / "stale.py"
+        stale_source.write_text("def cached_before_limit(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="limited") == 1
+        stale_source.unlink()
+        (root / "new.py").write_text("def new_source(): pass\n", encoding="utf-8")
+
+        assert temp_indexer.index_directory(root, project_key="limited", max_files=1) == 1
+        assert temp_graph_store.find_definition("limited", "cached_before_limit")
+
+    def test_index_directory_does_not_prune_when_root_is_missing(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "removed-project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_without_root(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="missing-root") == 1
+        source.unlink()
+        root.rmdir()
+
+        assert temp_indexer.index_directory(root, project_key="missing-root") == 0
+        assert temp_graph_store.find_definition("missing-root", "cached_without_root")
+
+    def test_schema_indexes_edges_by_source_symbol(self, tmp_path: Path) -> None:
+        backends = (
+            ("turso", TursoLocalEngine),
+            ("sqlite", SQLiteEngine),
+        )
+        for name, engine_factory in backends:
+            database_path = tmp_path / f"{name}.db"
+            engine = engine_factory(database_path)
+            store = CodeGraphStore(database_path, storage_engine=engine)
+            try:
+                with store._get_connection() as connection:
+                    connection.execute("DROP INDEX IF EXISTS idx_edges_source")
+            finally:
+                engine.close()
+
+            engine = engine_factory(database_path)
+            store = CodeGraphStore(database_path, storage_engine=engine)
+            try:
+                with store._get_connection() as connection:
+                    indexes = connection.execute("PRAGMA index_list(symbol_edges)").fetchall()
+
+                assert "idx_edges_source" in {index["name"] for index in indexes}
+            finally:
+                engine.close()
+
+    def test_call_tree_traces_callers_and_callees_without_cycles(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        app_symbols = [
+            CodeSymbol("entry", "function", 1, 2, file_path="/src/app.py"),
+            CodeSymbol("main", "function", 4, 5, file_path="/src/app.py"),
+        ]
+        temp_graph_store.save_file_symbols(
+            "call-tree",
+            "/src/app.py",
+            [
+                (app_symbols[0], [SymbolEdge("main", "calls")]),
+                (app_symbols[1], [SymbolEdge("parse", "calls")]),
+            ],
+        )
+        parser_symbols = [
+            CodeSymbol("parse", "function", 1, 2, file_path="/lib/parser.py"),
+            CodeSymbol("normalize", "function", 4, 5, file_path="/lib/parser.py"),
+        ]
+        temp_graph_store.save_file_symbols(
+            "call-tree",
+            "/lib/parser.py",
+            [
+                (
+                    parser_symbols[0],
+                    [SymbolEdge("normalize", "calls"), SymbolEdge("main", "calls")],
+                ),
+                (parser_symbols[1], []),
+            ],
+        )
+
+        result = temp_graph_store.get_symbol_call_tree("call-tree", "main", max_depth=3)
+
+        assert {item["symbol_name"] for item in result["callers"]} == {"entry", "parse"}
+        assert [item["symbol_name"] for item in result["callees"]] == ["parse", "normalize"]
+        assert all(item["symbol_name"] != "main" for item in result["callees"])
+
+    def test_type_hierarchy_traces_base_and_derived_types(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        base = CodeSymbol("Base", "class", 1, 2, file_path="/src/types.py")
+        child = CodeSymbol("Child", "class", 4, 5, file_path="/src/types.py")
+        grandchild = CodeSymbol("Grandchild", "class", 7, 8, file_path="/src/types.py")
+        temp_graph_store.save_file_symbols("types", "/src/base.py", [(base, [])])
+        temp_graph_store.save_file_symbols(
+            "types",
+            "/src/child.py",
+            [
+                (child, [SymbolEdge("Base", "inherits")]),
+                (grandchild, [SymbolEdge("Child", "inherits")]),
+            ],
+        )
+
+        result = temp_graph_store.get_type_hierarchy("types", "Child", max_depth=3)
+
+        assert [item["symbol_name"] for item in result["bases"]] == ["Base"]
+        assert [item["symbol_name"] for item in result["derived"]] == ["Grandchild"]
+
+    def test_graph_writes_use_backend_transaction_start(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        begins: list[str] = []
+        original_execute = StorageConnection.execute
+
+        def record_begin(connection, sql, *args, **kwargs):
+            if sql.startswith("BEGIN"):
+                begins.append(sql)
+            return original_execute(connection, sql, *args, **kwargs)
+
+        monkeypatch.setattr(StorageConnection, "execute", record_begin)
+        backends = (
+            ("turso", TursoLocalEngine, "BEGIN"),
+            ("sqlite", SQLiteEngine, "BEGIN IMMEDIATE"),
+        )
+        for name, engine_factory, expected_begin in backends:
+            engine = engine_factory(tmp_path / f"{name}.db")
+            store = CodeGraphStore(storage_engine=engine)
+            symbol = CodeSymbol(f"{name}_symbol", "function", 1, 2)
+
+            store.save_file_symbols(name, str(tmp_path / f"{name}.py"), [(symbol, [])])
+
+            assert begins[-1] == expected_begin
+            engine.close()
+
+    def test_index_files_commits_all_file_graphs_once(
+        self,
+        temp_graph_store: CodeGraphStore,
+        temp_indexer: CodeGraphIndexer,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        files = [tmp_path / "first.py", tmp_path / "second.py"]
+        files[0].write_text("def first(): pass\n", encoding="utf-8")
+        files[1].write_text("def second(): pass\n", encoding="utf-8")
+        commits = 0
+        original_commit = StorageConnection.commit
+        original_executemany = StorageConnection.executemany
+        metadata_batches: list[int] = []
+
+        def record_commit(connection: StorageConnection) -> None:
+            nonlocal commits
+            commits += 1
+            original_commit(connection)
+
+        def record_batch(connection: StorageConnection, sql: str, parameters) -> StorageConnection:
+            rows = list(parameters)
+            if "INSERT INTO file_metadata" in sql:
+                metadata_batches.append(len(rows))
+            return original_executemany(connection, sql, rows)
+
+        monkeypatch.setattr(StorageConnection, "commit", record_commit)
+        monkeypatch.setattr(StorageConnection, "executemany", record_batch)
+        indexed = temp_indexer.index_files(files, "batch")
+
+        assert indexed == 2
+        assert commits == 1
+        assert metadata_batches == [2]
+        assert temp_graph_store.get_stats("batch") == {"files": 2, "symbols": 2, "edges": 0}
+
+    def test_remove_file_symbols_removes_edges_and_metadata(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        symbol = CodeSymbol("caller", "function", 1, 2)
+        edge = SymbolEdge("target", "calls")
+        temp_graph_store.save_file_symbols("remove", "/src/a.py", [(symbol, [edge])], 12.0)
+
+        temp_graph_store.remove_file_symbols("remove", "/src/a.py")
+
+        assert temp_graph_store.get_file_symbols("remove", "/src/a.py") == []
+        assert temp_graph_store.get_file_mtime("remove", "/src/a.py") is None
+        assert temp_graph_store.get_stats("remove") == {"files": 0, "symbols": 0, "edges": 0}
+        with temp_graph_store._get_connection() as connection:
+            edge_count = connection.execute("SELECT COUNT(*) FROM symbol_edges").fetchone()[0]
+        assert edge_count == 0
+
+        temp_graph_store.save_file_symbols("remove", "/src/a.py", [(symbol, [edge])], 13.0)
+
+        assert len(temp_graph_store.get_file_symbols("remove", "/src/a.py")) == 1
+        assert temp_graph_store.get_stats("remove") == {"files": 1, "symbols": 1, "edges": 1}
+
     def test_save_and_retrieve_symbols(self, temp_graph_store: CodeGraphStore) -> None:
         sym = CodeSymbol(
             symbol_name="Calculator",
@@ -57,6 +438,166 @@ class TestCodeGraphStore:
         assert stats["files"] == 1
         assert stats["symbols"] == 1
         assert stats["edges"] == 1
+
+    def test_save_file_symbols_batches_rows_and_preserves_edges(
+        self, temp_graph_store: CodeGraphStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batches: list[tuple[str, int]] = []
+        original_executemany = StorageConnection.executemany
+
+        def record_batch(connection: StorageConnection, sql: str, parameters) -> StorageConnection:
+            rows = list(parameters)
+            batches.append((sql, len(rows)))
+            return original_executemany(connection, sql, rows)
+
+        monkeypatch.setattr(StorageConnection, "executemany", record_batch)
+        caller_a = CodeSymbol("caller_a", "function", 1, 3)
+        caller_b = CodeSymbol("caller_b", "function", 5, 7)
+        temp_graph_store.save_file_symbols(
+            "batch",
+            "/src/batch.py",
+            [
+                (caller_a, [SymbolEdge("target_a", "calls"), SymbolEdge("target_b", "imports")]),
+                (caller_b, [SymbolEdge("target_a", "calls")]),
+            ],
+        )
+
+        assert [count for _, count in batches] == [2, 3, 1]
+        assert temp_graph_store.get_stats("batch") == {"files": 1, "symbols": 2, "edges": 3}
+        refs = temp_graph_store.find_references("batch", "target_a")
+        assert [(ref["caller_name"], ref["relationship_type"]) for ref in refs] == [
+            ("caller_a", "calls"),
+            ("caller_b", "calls"),
+        ]
+
+        batches.clear()
+        temp_graph_store.save_file_symbols(
+            "batch", "/src/batch.py", [(caller_b, [SymbolEdge("target_c", "calls")])]
+        )
+
+        assert [count for _, count in batches] == [1, 1]
+        assert any("UPDATE symbol_edges" in sql for sql, _ in batches)
+        assert temp_graph_store.get_stats("batch") == {"files": 1, "symbols": 1, "edges": 1}
+        assert temp_graph_store.find_references("batch", "target_a") == []
+
+    def test_save_file_symbols_keeps_ids_for_unchanged_graph(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        symbol = CodeSymbol("caller", "function", 1, 4, "def caller()")
+        edges = [SymbolEdge("target_a", "calls"), SymbolEdge("target_b", "imports")]
+        temp_graph_store.save_file_symbols("stable", "/src/stable.py", [(symbol, edges)], 1.0)
+        original_ids = [
+            row["id"] for row in temp_graph_store.get_file_symbols("stable", "/src/stable.py")
+        ]
+
+        temp_graph_store.save_file_symbols("stable", "/src/stable.py", [(symbol, edges)], 2.0)
+
+        current_ids = [
+            row["id"] for row in temp_graph_store.get_file_symbols("stable", "/src/stable.py")
+        ]
+        assert current_ids == original_ids
+        assert temp_graph_store.get_file_mtime("stable", "/src/stable.py") == 2.0
+        assert temp_graph_store.get_stats("stable") == {"files": 1, "symbols": 1, "edges": 2}
+
+    def test_save_file_symbols_skips_symbol_read_for_unchanged_graph(
+        self,
+        temp_graph_store: CodeGraphStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        symbol = CodeSymbol("caller", "function", 1, 4, "def caller()")
+        edges = [SymbolEdge("target", "calls")]
+        temp_graph_store.save_file_symbols("fast-path", "/src/a.py", [(symbol, edges)], 1.0)
+        original_ids = [
+            row["id"] for row in temp_graph_store.get_file_symbols("fast-path", "/src/a.py")
+        ]
+        statements: list[str] = []
+        original_execute = StorageConnection.execute
+
+        def record_execute(connection, sql, *args, **kwargs):
+            statements.append(sql)
+            return original_execute(connection, sql, *args, **kwargs)
+
+        monkeypatch.setattr(StorageConnection, "execute", record_execute)
+
+        temp_graph_store.save_file_symbols("fast-path", "/src/a.py", [(symbol, edges)], 2.0)
+
+        assert not any("LEFT JOIN symbol_edges" in sql for sql in statements)
+        assert [
+            row["id"] for row in temp_graph_store.get_file_symbols("fast-path", "/src/a.py")
+        ] == original_ids
+        assert temp_graph_store.get_file_mtime("fast-path", "/src/a.py") == 2.0
+
+    def test_save_file_symbols_applies_symbol_delta_and_preserves_matching_ids(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        original = [
+            (CodeSymbol("stable", "function", 1, 2), [SymbolEdge("target_a", "calls")]),
+            (CodeSymbol("rename_me", "function", 5, 6), [SymbolEdge("old_target", "calls")]),
+            (CodeSymbol("remove_me", "function", 9, 10), [SymbolEdge("removed_target", "imports")]),
+        ]
+        temp_graph_store.save_file_symbols("delta", "/src/delta.py", original, 1.0)
+        original_ids = {
+            row["symbol_name"]: row["id"]
+            for row in temp_graph_store.get_file_symbols("delta", "/src/delta.py")
+        }
+
+        updated = [
+            original[0],
+            (
+                CodeSymbol("renamed", "function", 5, 6, signature="def renamed()"),
+                [SymbolEdge("new_target", "calls")],
+            ),
+            (CodeSymbol("added", "function", 13, 14), [SymbolEdge("new_import", "imports")]),
+        ]
+        temp_graph_store.save_file_symbols("delta", "/src/delta.py", updated, 2.0)
+
+        current = {
+            row["symbol_name"]: row["id"]
+            for row in temp_graph_store.get_file_symbols("delta", "/src/delta.py")
+        }
+        assert current["stable"] == original_ids["stable"]
+        assert current["renamed"] == original_ids["rename_me"]
+        assert current["added"] not in original_ids.values()
+        assert "rename_me" not in current
+        assert "remove_me" not in current
+        assert temp_graph_store.find_references("delta", "old_target") == []
+        assert temp_graph_store.find_references("delta", "removed_target") == []
+        assert [
+            ref["caller_name"] for ref in temp_graph_store.find_references("delta", "new_target")
+        ] == ["renamed"]
+        assert [
+            ref["caller_name"] for ref in temp_graph_store.find_references("delta", "new_import")
+        ] == ["added"]
+        assert temp_graph_store.get_file_mtime("delta", "/src/delta.py") == 2.0
+        assert temp_graph_store.get_stats("delta") == {"files": 1, "symbols": 3, "edges": 3}
+
+    def test_save_file_symbols_updates_changed_edges_in_place(
+        self, temp_graph_store: CodeGraphStore
+    ) -> None:
+        symbol = CodeSymbol("caller", "function", 1, 3)
+        path = "/src/edge-delta.py"
+        temp_graph_store.save_file_symbols(
+            "edge-delta", path, [(symbol, [SymbolEdge("before", "calls")])]
+        )
+        with temp_graph_store._get_connection() as connection:
+            original = connection.execute(
+                "SELECT id FROM symbol_edges WHERE target_symbol_name = ?", ("before",)
+            ).fetchone()
+        assert original is not None
+
+        temp_graph_store.save_file_symbols(
+            "edge-delta", path, [(symbol, [SymbolEdge("after", "calls")])]
+        )
+
+        with temp_graph_store._get_connection() as connection:
+            updated = connection.execute(
+                "SELECT id, target_symbol_name, relationship_type FROM symbol_edges"
+            ).fetchone()
+        assert updated is not None
+        assert updated["id"] == original["id"]
+        assert updated["target_symbol_name"] == "after"
+        assert updated["relationship_type"] == "calls"
+        assert temp_graph_store.get_stats("edge-delta") == {"files": 1, "symbols": 1, "edges": 1}
 
     def test_find_definition_and_references(self, temp_graph_store: CodeGraphStore) -> None:
         sym_service = CodeSymbol(
@@ -164,6 +705,114 @@ class TestCodeGraphStore:
 
 @pytest.mark.unit
 class TestCodeGraphIndexer:
+    def test_indexer_extracts_polyglot_symbols_and_dependency_edges(
+        self,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+        tmp_path: Path,
+    ) -> None:
+        sources = {
+            "billing.ts": """// Billing service
+export class BillingService extends BaseService {
+  public charge(invoice: Invoice): Result {
+    return send(invoice);
+  }
+}
+export async function processPayment(amount: number): Promise<Result> {
+  return authorize(amount);
+}
+export const handlePayment = (amount: number): number => {
+  return convert(amount);
+};
+""",
+            "billing.go": """// Billing store
+type BillingStore struct {
+}
+func ProcessPayment(amount float64) bool {
+    return authorize(amount)
+}
+func (store *BillingStore) Save(amount float64) bool {
+    return persist(amount)
+}
+""",
+            "billing.rs": """/// Payment store
+pub struct PaymentStore {
+}
+pub trait Writer {
+}
+impl Writer for PaymentStore {
+    pub async fn save(item: Item) -> bool {
+        persist(item);
+    }
+}
+pub fn dispatch(item: Item) {
+    send(item);
+}
+""",
+        }
+        paths = [tmp_path / filename for filename in sources]
+        for path, source in zip(paths, sources.values(), strict=True):
+            path.write_text(source, encoding="utf-8")
+
+        assert [temp_indexer.index_file(path, "polyglot") for path in paths] == [4, 3, 5]
+        symbols = {
+            row["symbol_name"]
+            for path in paths
+            for row in temp_graph_store.get_file_symbols("polyglot", str(path.resolve()))
+        }
+        assert {
+            "BillingService",
+            "BillingService.charge",
+            "processPayment",
+            "handlePayment",
+            "BillingStore",
+            "ProcessPayment",
+            "BillingStore.Save",
+            "PaymentStore",
+            "Writer",
+            "PaymentStore.save",
+            "dispatch",
+        } <= symbols
+
+        with temp_graph_store._get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT source.symbol_name, edge.target_symbol_name, edge.relationship_type
+                FROM symbol_edges AS edge
+                JOIN code_symbols AS source ON source.id = edge.source_symbol_id
+                WHERE source.project_key = ?
+                """,
+                ("polyglot",),
+            ).fetchall()
+        edges = {
+            (row["symbol_name"], row["target_symbol_name"], row["relationship_type"])
+            for row in rows
+        }
+        assert {
+            ("BillingService", "BaseService", "inherits"),
+            ("BillingService.charge", "send", "calls"),
+            ("processPayment", "authorize", "calls"),
+            ("handlePayment", "convert", "calls"),
+            ("BillingStore.Save", "persist", "calls"),
+            ("PaymentStore", "Writer", "inherits"),
+            ("PaymentStore.save", "persist", "calls"),
+            ("dispatch", "send", "calls"),
+        } <= edges
+
+    def test_parse_python_source_preserves_nested_call_edge_order(
+        self, temp_indexer: CodeGraphIndexer
+    ) -> None:
+        parsed = temp_indexer.parse_python_source(
+            "def chained():\n    return foo().bar() + outer(inner())\n",
+            "/src/chained.py",
+            "calls",
+        )
+
+        assert [
+            (symbol.symbol_name, [edge.target_symbol_name for edge in edges])
+            for symbol, edges in parsed
+        ] == [("chained", ["bar", "foo", "outer", "inner"])]
+
     def test_parse_complex_python_source(self, temp_indexer: CodeGraphIndexer) -> None:
         code = '''
 """Module level docstring."""

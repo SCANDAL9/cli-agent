@@ -4,11 +4,24 @@ Unit tests for MemoryStore (FTS5 search, CRUD, ranking, edge cases).
 
 import pytest
 
+from cli_agent.config import StorageConfig
 from cli_agent.memory import MemoryStore, resolve_project_key
 
 
 @pytest.mark.unit
 class TestMemoryStore:
+    def test_explicit_sqlite_runtime_keeps_legacy_fts5_search(self, tmp_path):
+        store = MemoryStore(
+            db_path=tmp_path / "sqlite.db",
+            storage_config=StorageConfig(backend="sqlite"),
+        )
+        store.save_memory("Legacy search", "SQLite compatibility remains available")
+
+        results = store.search_memory("compatibility remains")
+
+        assert len(results) == 1
+        assert results[0]["title"] == "Legacy search"
+
     def test_save_and_retrieve_recent_memories(self, temp_memory_store: MemoryStore):
         store = temp_memory_store
 
