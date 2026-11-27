@@ -61,6 +61,7 @@ from .preflight import PreflightEngine, ProjectSelector, ServiceUsageManager
 from .search import get_hybrid_search_engine
 from .security import RiskLevel, SecurityPolicy
 from .session import SessionStore, generate_session_id
+from .storage.turso import TursoLocalEngine
 from .tdd import AutonomousTDDEngine
 from .team import MultiAgentTeam, set_active_team
 from .theme import (
@@ -74,6 +75,7 @@ from .tools import _redact_secrets, set_active_sandbox
 from .tui import TUIApp, TUILayoutManager
 from .vertex import VertexAgentClient
 from .voice import VoiceAgentEngine
+from .worker_protocol import DistributedWorkerCoordinator
 from .workflows import (
     WorkflowEngine,
     WorkflowHistoryStore,
@@ -1551,7 +1553,15 @@ async def _run_interactive_session(
     worktree_manager = WorktreeManager()
     active_sandbox: WorktreeSession | None = None
 
-    team_coordinator = MultiAgentTeam(client=client)
+    worker_coordinator = DistributedWorkerCoordinator(
+        storage=TursoLocalEngine(Path.home() / ".cli-agent" / "worker-leases.db"),
+        security_policy=security_policy,
+        repo_root=Path.cwd(),
+    )
+    team_coordinator = MultiAgentTeam(
+        client=client,
+        worker_coordinator=worker_coordinator,
+    )
     set_active_team(team_coordinator)
 
     async def execute_workflow_prompt(prompt: str, worktree: Path) -> str:

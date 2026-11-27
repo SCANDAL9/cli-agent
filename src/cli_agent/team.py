@@ -25,6 +25,12 @@ from .tools import (
     worker_execution_scope,
 )
 from .vertex import VertexAgentClient
+from .worker_protocol import (
+    DistributedWorkerCoordinator,
+    WorkerApplyResult,
+    WorkerCredential,
+    WorkerLease,
+)
 from .worktree import (
     ASTThreeWayMerger,
     MergeResult,
@@ -497,13 +503,47 @@ class MultiAgentTeam:
         worktree_manager: WorktreeManager | None = None,
         event_bus: EventBus | None = None,
         repo_root: Path | None = None,
+        worker_coordinator: DistributedWorkerCoordinator | None = None,
     ) -> None:
         self.client = client
         self.max_depth = max_depth
         self.worktree_manager = worktree_manager
         self.event_bus = event_bus
         self.repo_root = repo_root.resolve() if repo_root is not None else None
+        self.worker_coordinator = worker_coordinator
         self._active_workers: list[WorkerResult] = []
+
+    def register_virtual_worker(self, worker_id: str | None = None) -> WorkerCredential:
+        """Registers an in-process worker identity for local-only coordination."""
+        if self.worker_coordinator is None:
+            raise RuntimeError("Local worker coordination is not configured.")
+        return self.worker_coordinator.register_worker(worker_id)
+
+    def claim_worker_task(
+        self,
+        task_id: str,
+        worker: WorkerCredential,
+        *,
+        lease_seconds: float = 60.0,
+    ) -> WorkerLease:
+        """Claims a worker task using a Turso-persisted, generation-bound lease."""
+        if self.worker_coordinator is None:
+            raise RuntimeError("Local worker coordination is not configured.")
+        return self.worker_coordinator.claim_task(task_id, worker, lease_seconds=lease_seconds)
+
+    async def apply_worker_diff(
+        self,
+        lease: WorkerLease,
+        worker: WorkerCredential,
+        diff: str,
+        result_signature: str,
+    ) -> WorkerApplyResult:
+        """Applies an authenticated local worker diff after SecurityPolicy approval."""
+        if self.worker_coordinator is None:
+            raise RuntimeError("Local worker coordination is not configured.")
+        return await self.worker_coordinator.apply_worker_diff(
+            lease, worker, diff, result_signature
+        )
 
     def _get_role_tools(self, role: AgentRole) -> list[dict[str, Any]]:
         """Filters global tool declarations according to the role's privilege matrix."""

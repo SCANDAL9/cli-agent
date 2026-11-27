@@ -82,6 +82,22 @@ class TestToolsUnit:
         ]
         assert "between 1 and 5" in tools.get_symbol_call_tree("refresh", max_depth=6)["error"]
 
+    def test_wasm_plugin_is_registered_with_declared_capabilities(self) -> None:
+        from cli_agent import tools
+
+        declaration = next(
+            item for item in tools.GEMINI_TOOLS_DECLARATIONS if item["name"] == "run_wasm_plugin"
+        )
+
+        assert tools.TOOL_REGISTRY["run_wasm_plugin"] is tools.run_wasm_plugin
+        assert {
+            "module_path",
+            "read_dirs",
+            "write_dirs",
+            "environment_variables",
+            "network_access",
+        } <= set(declaration["parameters"]["properties"])
+
     def test_apply_code_action_lists_then_applies_only_the_selected_workspace_edit(
         self, monkeypatch, tmp_path: Path
     ) -> None:
@@ -573,12 +589,22 @@ class TestToolsUnit:
 
     def test_run_command_success_and_timeout(self, tmp_path: Path):
         # Successful command
-        res = run_command("echo 'test-output'", cwd=str(tmp_path))
+        res = run_command(
+            "echo 'test-output'",
+            cwd=str(tmp_path),
+            network_access=True,
+            allow_reduced_isolation=True,
+        )
         assert res.get("exit_code") == 0
         assert "test-output" in res.get("stdout", "")
 
         # Timeout command
-        timeout_res = run_command("sleep 5", timeout_seconds=1)
+        timeout_res = run_command(
+            "sleep 5",
+            timeout_seconds=1,
+            network_access=True,
+            allow_reduced_isolation=True,
+        )
         assert "timed out" in timeout_res.get("error", "")
 
     def test_execute_tool_dispatcher(self, tmp_path: Path):
@@ -635,7 +661,12 @@ class TestToolsUnit:
             'import sys\nsys.stdout.write("H" * 2000 + "M" * 5000 + "T" * 8000)\n',
             encoding="utf-8",
         )
-        res = run_command(f"python3 {script}", cwd=str(tmp_path))
+        res = run_command(
+            f"python3 {script}",
+            cwd=str(tmp_path),
+            network_access=True,
+            allow_reduced_isolation=True,
+        )
         assert res.get("exit_code") == 0
         assert res.get("truncated") is True
         stdout = res.get("stdout", "")
@@ -654,7 +685,12 @@ class TestToolsUnit:
             'print("api_key=sk-1234567890abcdef12345678")\n',
             encoding="utf-8",
         )
-        sec_res = run_command(f"python3 {secret_script}", cwd=str(tmp_path))
+        sec_res = run_command(
+            f"python3 {secret_script}",
+            cwd=str(tmp_path),
+            network_access=True,
+            allow_reduced_isolation=True,
+        )
         sec_out = sec_res.get("stdout", "")
         assert "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" not in sec_out
         assert "[REDACTED_TOKEN]" in sec_out
@@ -672,6 +708,8 @@ class TestToolsUnit:
             {
                 "command": "python3 -u -c 'import time; print(\"server_started\", flush=True); time.sleep(10)'",
                 "cwd": str(tmp_path),
+                "network_access": True,
+                "allow_reduced_isolation": True,
             },
         )
         assert start_res.get("status") == "started"

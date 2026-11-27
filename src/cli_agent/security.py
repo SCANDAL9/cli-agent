@@ -3,7 +3,9 @@ Security policy and Human-in-the-Loop (HITL) permission gate for cli-agent.
 Classifies tool calls by risk level and intercepts potentially destructive operations.
 """
 
+import hashlib
 import inspect
+import json
 import re
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -55,6 +57,21 @@ class SecurityPolicy:
 
     def evaluate_risk(self, tool_name: str, arguments: dict[str, Any]) -> RiskLevel:
         """Classifies tool invocation into SAFE, MEDIUM, or HIGH risk."""
+        if tool_name == "apply_worker_diff":
+            return RiskLevel.HIGH
+
+        if tool_name == "run_wasm_plugin":
+            capability_fields = (
+                "read_dirs",
+                "write_dirs",
+                "environment_variables",
+            )
+            if arguments.get("network_access") or any(
+                arguments.get(field) for field in capability_fields
+            ):
+                return RiskLevel.HIGH
+            return RiskLevel.MEDIUM
+
         if tool_name == "apply_code_action":
             selection = any(
                 arguments.get(field) is not None
@@ -91,6 +108,8 @@ class SecurityPolicy:
             return RiskLevel.MEDIUM
 
         if tool_name in {"run_command", "start_background_process"}:
+            if arguments.get("network_access") or arguments.get("allow_reduced_isolation"):
+                return RiskLevel.HIGH
             cmd = arguments.get("command", "")
             for pattern in COMPILED_HIGH_RISK:
                 if pattern.search(cmd):
@@ -176,9 +195,59 @@ class SecurityPolicy:
         self._session_allowlist.add(cache_key)
 
     def _get_cache_key(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        if tool_name == "apply_worker_diff":
+            diff = arguments.get("diff")
+            if isinstance(diff, str):
+                diff_bytes = diff.encode("utf-8")
+            elif isinstance(diff, bytes):
+                diff_bytes = diff
+            else:
+                diff_bytes = repr(diff).encode("utf-8")
+            diff_hash = hashlib.sha256(diff_bytes).hexdigest()
+            return (
+                "apply_worker_diff:"
+                f"{arguments.get('task_id', '')}:"
+                f"{arguments.get('worker_id', '')}:"
+                f"{arguments.get('lease_id', '')}:"
+                f"{arguments.get('generation', '')}:"
+                f"{arguments.get('diff_sha256', '')}:"
+                f"{diff_hash}"
+            )
+
+        if tool_name == "run_wasm_plugin":
+
+            def normalized_values(name: str) -> list[str]:
+                value = arguments.get(name, [])
+                if isinstance(value, (list, tuple, set)):
+                    return sorted(str(item) for item in value)
+                return [repr(value)] if value else []
+
+            capabilities = {
+                "read_dirs": normalized_values("read_dirs"),
+                "write_dirs": normalized_values("write_dirs"),
+                "environment_variables": normalized_values("environment_variables"),
+                "network_access": bool(arguments.get("network_access")),
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(capabilities, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()[:16]
+            module_path = str(arguments.get("module_path", "")).strip().replace("\\", "/")
+            return f"run_wasm_plugin:{module_path}:{fingerprint}"
+
+        capability_suffix = ""
+        if tool_name in {"run_command", "start_background_process"}:
+            network_access = bool(arguments.get("network_access"))
+            reduced_isolation = bool(arguments.get("allow_reduced_isolation"))
+            if network_access or reduced_isolation:
+                capability_suffix = (
+                    f":network={int(network_access)}:reduced-isolation={int(reduced_isolation)}"
+                )
         if tool_name == "run_command":
             cmd = arguments.get("command", "").strip()
             # Cache the base command name (e.g. pytest, git status)
-            return f"run_command:{cmd}"
+            return f"run_command:{cmd}{capability_suffix}"
+        if tool_name == "start_background_process" and capability_suffix:
+            cmd = arguments.get("command", "").strip()
+            return f"start_background_process:{cmd}{capability_suffix}"
         path = arguments.get("path", "").strip()
-        return f"{tool_name}:{path}"
+        return f"{tool_name}:{path}{capability_suffix}"
