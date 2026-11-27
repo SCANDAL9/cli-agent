@@ -20,6 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 turso = ["libsql>=0.1.11"]
+wasm = [
+    "wasmtime>=51,<52",
+]
 
 [dependency-groups]
 dev = [
@@ -34,6 +37,10 @@ dev = [
 [project.scripts]
 kanon = "cli_agent:main"
 cli-agent = "cli_agent:main"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

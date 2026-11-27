@@ -82,6 +82,22 @@ class TestToolsUnit:
         ]
         assert "between 1 and 5" in tools.get_symbol_call_tree("refresh", max_depth=6)["error"]
 
+    def test_wasm_plugin_is_registered_with_declared_capabilities(self) -> None:
+        from cli_agent import tools
+
+        declaration = next(
+            item for item in tools.GEMINI_TOOLS_DECLARATIONS if item["name"] == "run_wasm_plugin"
+        )
+
+        assert tools.TOOL_REGISTRY["run_wasm_plugin"] is tools.run_wasm_plugin
+        assert {
+            "module_path",
+            "read_dirs",
+            "write_dirs",
+            "environment_variables",
+            "network_access",
+        } <= set(declaration["parameters"]["properties"])
+
     def test_apply_code_action_lists_then_applies_only_the_selected_workspace_edit(
         self, monkeypatch, tmp_path: Path
     ) -> None:

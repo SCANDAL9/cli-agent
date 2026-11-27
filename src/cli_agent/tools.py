@@ -1480,6 +1480,29 @@ async def delegate_task(
     }
 
 
+def run_wasm_plugin(
+    module_path: str,
+    arguments: list[str] | None = None,
+    read_dirs: list[str] | None = None,
+    write_dirs: list[str] | None = None,
+    environment_variables: list[str] | None = None,
+    network_access: bool = False,
+) -> dict[str, Any]:
+    """Runs a WASI plugin with only the explicitly requested host capabilities."""
+    from .wasm_runtime import WasmCapabilities, WasmPluginRuntime
+
+    workspace_root = _active_sandbox_var.get() or Path.cwd().resolve()
+    runtime = WasmPluginRuntime(workspace_root)
+    capabilities = WasmCapabilities(
+        read_dirs=read_dirs or (),
+        write_dirs=write_dirs or (),
+        environment_variables=environment_variables or (),
+        network_access=network_access,
+    )
+    result = runtime.run(module_path, arguments=arguments or (), capabilities=capabilities)
+    return result.to_dict()
+
+
 # Tool Dispatcher
 TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "read_file": read_file,
@@ -1497,6 +1520,7 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "write_file": write_file,
     "edit_file": edit_file,
     "run_command": run_command,
+    "run_wasm_plugin": run_wasm_plugin,
     "start_background_process": start_background_process,
     "check_background_process": check_background_process,
     "stop_background_process": stop_background_process,
@@ -1831,6 +1855,44 @@ GEMINI_TOOLS_DECLARATIONS = [
                 },
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "run_wasm_plugin",
+        "description": "Runs a WASI WebAssembly plugin from the workspace. Filesystem, environment, and network grants are empty by default; requesting any grant requires high-risk SecurityPolicy approval.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "module_path": {
+                    "type": "STRING",
+                    "description": "Workspace-relative path to a compiled .wasm module.",
+                },
+                "arguments": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Arguments passed to the WASI module (default: none).",
+                },
+                "read_dirs": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Workspace directories granted read-only access; empty by default.",
+                },
+                "write_dirs": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Workspace directories granted writable access; empty by default.",
+                },
+                "environment_variables": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Host environment variable names explicitly passed to the plugin; empty by default.",
+                },
+                "network_access": {
+                    "type": "BOOLEAN",
+                    "description": "Grant WASI network access (default: false; requires high-risk approval).",
+                },
+            },
+            "required": ["module_path"],
         },
     },
     {
