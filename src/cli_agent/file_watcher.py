@@ -286,6 +286,7 @@ class FileWatcher:
             return []
         paths = sorted(self._native_pending, key=str)[:max_events]
         batch = [self._native_pending.pop(path) for path in paths]
+        index_events: list[FileChange] = []
         for event in batch:
             if event.previous_path is not None:
                 self.indexer.store.remove_file_symbols(self.project_key, str(event.previous_path))
@@ -296,15 +297,22 @@ class FileWatcher:
                 if self._snapshot is not None:
                     self._snapshot.pop(event.path, None)
             elif self._included(event.path) and event.path.is_file():
-                self.indexer.index_file(event.path, self.project_key)
-                try:
-                    stat = event.path.stat()
-                except OSError:
-                    continue
-                if self._snapshot is not None:
-                    self._snapshot[event.path] = _FileState(
-                        stat.st_mtime_ns, stat.st_size, stat.st_ino
-                    )
+                index_events.append(event)
+
+        try:
+            if index_events:
+                self.indexer.index_files([event.path for event in index_events], self.project_key)
+        except Exception:
+            self._native_pending.update({event.path: event for event in index_events})
+            raise
+
+        for event in index_events:
+            try:
+                stat = event.path.stat()
+            except OSError:
+                continue
+            if self._snapshot is not None:
+                self._snapshot[event.path] = _FileState(stat.st_mtime_ns, stat.st_size, stat.st_ino)
         return batch
 
     def close(self) -> None:

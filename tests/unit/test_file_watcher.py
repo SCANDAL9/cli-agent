@@ -2,8 +2,10 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from cli_agent.code_graph import CodeGraphIndexer, CodeGraphStore
-from cli_agent.file_watcher import FileWatcher
+from cli_agent.file_watcher import FileChange, FileWatcher
 
 
 def test_linux_inotify_events_refresh_graph_without_poll_interval_delay(
@@ -112,3 +114,65 @@ def test_file_watcher_bounds_event_batches_without_losing_pending_events(tmp_pat
     assert len(first) == 1
     assert len(remaining) == 2
     assert first[0].path.name == "a.py"
+
+
+def test_native_watcher_indexes_pending_paths_in_one_batch(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    files = [root / "first.py", root / "second.py"]
+    for path in files:
+        path.write_text(f"def {path.stem}_old(): pass\n", encoding="utf-8")
+    store = CodeGraphStore(tmp_path / "graph.db")
+    indexer = CodeGraphIndexer(store)
+    for path in files:
+        indexer.index_file(path, "watch-batch")
+    watcher = FileWatcher(root, indexer, "watch-batch")
+    watcher.start()
+    try:
+        for path in files:
+            path.write_text(f"def {path.stem}_new(): pass\n", encoding="utf-8")
+        paths = sorted((path.resolve() for path in files), key=str)
+        watcher._native_pending = {path: FileChange("modified", path) for path in paths}
+        calls = []
+
+        def record_batch(changed_paths, project_key):
+            calls.append(tuple(changed_paths))
+            return sum(indexer.index_file(path, project_key) for path in changed_paths)
+
+        monkeypatch.setattr(indexer, "index_files", record_batch, raising=False)
+        events = watcher._apply_native_pending(max_events=100)
+
+        assert len(events) == 2
+        assert calls == [tuple(paths)]
+        assert [
+            row["symbol_name"]
+            for path in files
+            for row in store.get_file_symbols("watch-batch", str(path))
+        ] == ["first_new", "second_new"]
+    finally:
+        watcher.close()
+
+
+def test_native_watcher_requeues_batch_when_indexing_fails(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    paths = [root / "first.py", root / "second.py"]
+    for path in paths:
+        path.write_text("def changed(): pass\n", encoding="utf-8")
+    watcher = FileWatcher(
+        root, CodeGraphIndexer(CodeGraphStore(tmp_path / "graph.db")), "watch-retry"
+    )
+    watcher.start()
+    pending = {path.resolve(): FileChange("modified", path.resolve()) for path in paths}
+    watcher._native_pending = pending.copy()
+
+    def fail_batch(changed_paths, project_key):
+        raise RuntimeError("temporary storage failure")
+
+    monkeypatch.setattr(watcher.indexer, "index_files", fail_batch, raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="temporary storage failure"):
+            watcher._apply_native_pending(max_events=100)
+        assert watcher._native_pending == pending
+    finally:
+        watcher.close()
