@@ -3,6 +3,7 @@ Unit tests for the Tree-sitter AST & Code Intelligence Graph module.
 """
 
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,140 @@ class TestCodeGraphStore:
         assert reopened_store.find_definition("restart", "before_restart") == []
         assert reopened_store.find_definition("restart", "after_restart")
         clear_storage_engine_cache()
+
+    def test_normal_graph_prunes_sources_deleted_while_offline(self, tmp_path: Path) -> None:
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        deleted_source = source_dir / "deleted.py"
+        deleted_source.write_text("def removed_after_restart():\n    return 1\n", encoding="utf-8")
+        other_root = tmp_path / "outside-project-root"
+        other_root.mkdir()
+        other_source = other_root / "kept.py"
+        other_source.write_text(
+            "def kept_outside_scanned_root():\n    return 2\n", encoding="utf-8"
+        )
+        graph_path = tmp_path / "code_graph.db"
+        graph_config = StorageConfig(
+            backend="turso",
+            replica_path=graph_path,
+            synchronous="NORMAL",
+        )
+
+        first_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        first_indexer = CodeGraphIndexer(first_store)
+        assert first_indexer.index_directory(source_dir, project_key="restart") == 1
+        assert first_indexer.index_directory(other_root, project_key="restart") == 1
+        clear_storage_engine_cache()
+        deleted_source.unlink()
+
+        reopened_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        reopened_indexer = CodeGraphIndexer(reopened_store)
+        try:
+            assert (
+                reopened_indexer.index_directory(source_dir, project_key="restart", max_files=None)
+                == 0
+            )
+            assert reopened_store.find_definition("restart", "removed_after_restart") == []
+            assert reopened_store.find_definition("restart", "kept_outside_scanned_root")
+        finally:
+            clear_storage_engine_cache()
+
+    def test_index_directory_preserves_other_roots_and_uses_atomic_cleanup(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_symbol(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="safe-prune") == 1
+        source.unlink()
+
+        with temp_graph_store._get_connection() as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_metadata_prune
+                BEFORE DELETE ON file_metadata
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced cleanup failure');
+                END
+                """
+            )
+
+        with pytest.raises(sqlite3.DatabaseError, match="forced cleanup failure"):
+            temp_indexer.index_directory(root, project_key="safe-prune")
+        assert temp_graph_store.find_definition("safe-prune", "cached_symbol")
+
+        other_root = tmp_path / "other-root"
+        other_root.mkdir()
+        other_source = other_root / "other.py"
+        other_source.write_text("def outside_scanned_root(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(other_root, project_key="safe-prune") == 1
+
+        with temp_graph_store._get_connection() as connection:
+            connection.execute("DROP TRIGGER reject_metadata_prune")
+        assert temp_indexer.index_directory(root, project_key="safe-prune") == 0
+        assert temp_graph_store.find_definition("safe-prune", "cached_symbol") == []
+        assert temp_graph_store.find_definition("safe-prune", "outside_scanned_root")
+
+    def test_index_directory_does_not_prune_on_incomplete_walk(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "incomplete-project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_after_scan_error(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="incomplete") == 1
+        source.unlink()
+
+        def incomplete_walk(_root: Path, *, onerror=None):
+            if onerror is not None:
+                onerror(PermissionError("unreadable subtree"))
+            return iter(())
+
+        monkeypatch.setattr(code_graph.os, "walk", incomplete_walk)
+        assert temp_indexer.index_directory(root, project_key="incomplete") == 0
+        assert temp_graph_store.find_definition("incomplete", "cached_after_scan_error")
+
+    def test_index_directory_does_not_prune_after_max_files_early_return(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "limited-project"
+        root.mkdir()
+        stale_source = root / "stale.py"
+        stale_source.write_text("def cached_before_limit(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="limited") == 1
+        stale_source.unlink()
+        (root / "new.py").write_text("def new_source(): pass\n", encoding="utf-8")
+
+        assert temp_indexer.index_directory(root, project_key="limited", max_files=1) == 1
+        assert temp_graph_store.find_definition("limited", "cached_before_limit")
+
+    def test_index_directory_does_not_prune_when_root_is_missing(
+        self,
+        tmp_path: Path,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+    ) -> None:
+        root = tmp_path / "removed-project"
+        root.mkdir()
+        source = root / "cached.py"
+        source.write_text("def cached_without_root(): pass\n", encoding="utf-8")
+        assert temp_indexer.index_directory(root, project_key="missing-root") == 1
+        source.unlink()
+        root.rmdir()
+
+        assert temp_indexer.index_directory(root, project_key="missing-root") == 0
+        assert temp_graph_store.find_definition("missing-root", "cached_without_root")
 
     def test_schema_indexes_edges_by_source_symbol(self, tmp_path: Path) -> None:
         backends = (

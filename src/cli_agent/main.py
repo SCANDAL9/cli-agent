@@ -201,9 +201,7 @@ def format_bottom_toolbar(
     bot_border = f"{'─' * term_w}\n"
     mode_str = "auto" if auto_approve else "default"
     mode_class = (
-        "class:bottom-toolbar.badge"
-        if auto_approve
-        else "class:bottom-toolbar.badge.default"
+        "class:bottom-toolbar.badge" if auto_approve else "class:bottom-toolbar.badge.default"
     )
     model_disp = _format_model_badge(model_name)
     effort_disp = normalize_effort(effort) if effort else _get_model_effort(model_name)
@@ -392,13 +390,7 @@ class PinnedFooterManager:
             return
         rows = self._rows
         # Reset DECSTBM to full screen and clear pinned footer rows before prompt_toolkit takes over
-        self._stream.write(
-            f"\x1b7"
-            f"\x1b[{rows - 1};1H\x1b[2K"
-            f"\x1b[{rows};1H\x1b[2K"
-            f"\x1b[r"
-            f"\x1b8"
-        )
+        self._stream.write(f"\x1b7\x1b[{rows - 1};1H\x1b[2K\x1b[{rows};1H\x1b[2K\x1b[r\x1b8")
         self._stream.flush()
         self._pinned = False
 
@@ -625,9 +617,7 @@ def render_session_transcript(
                 out.print(f"[bold {c_primary}]❯[/bold {c_primary}] " + "\n".join(text_chunks))
             if image_mimes:
                 mimes_str = ", ".join(image_mimes)
-                out.print(
-                    f"[dim]🖼 {len(image_mimes)} image(s) attached ({mimes_str})[/dim]"
-                )
+                out.print(f"[dim]🖼 {len(image_mimes)} image(s) attached ({mimes_str})[/dim]")
             out.print(f"[{c_border}]{sep}[/{c_border}]")
 
         elif role == "model":
@@ -747,6 +737,7 @@ async def show_models(
             )
         )
     ]
+
     def model_sort_key(m: ModelCatalogEntry) -> int:
         name = m.short_name.lower()
         if "3.8-flash" in name:
@@ -919,6 +910,7 @@ def _build_model_picker_app(
         event.app.exit(result=None)
 
     for num_idx in range(1, min(len(gemini_models), 9) + 1):
+
         def _make_num_handler(target_i: int) -> Any:
             def _pick_num(event: Any) -> None:
                 state["selected"] = target_i
@@ -943,9 +935,7 @@ def _build_model_picker_app(
             "picker.active": f"{p.accent} bold" if p.is_matugen else "ansigreen bold",
             "picker.effort_label": f"{p.secondary}" if p.is_matugen else "ansicyan",
             "picker.effort_active": (
-                f"bg:{p.selection_bg} {p.accent} bold"
-                if p.is_matugen
-                else "ansigreen bold"
+                f"bg:{p.selection_bg} {p.accent} bold" if p.is_matugen else "ansigreen bold"
             ),
             "picker.desc": p.muted if p.is_matugen else "dim",
             "picker.hint": f"{p.muted} italic" if p.is_matugen else "dim italic",
@@ -1048,7 +1038,10 @@ async def prompt_model_switch_dialog(
 
     content.append("Effort  ◀ ───●───◎───○───▶\n", style=f"dim {c_primary}")
     content.append("            low  medium  high\n", style="dim")
-    content.append(f"Select a number [1-{len(gemini_models)}] or type name (Enter to cancel)", style="dim italic")
+    content.append(
+        f"Select a number [1-{len(gemini_models)}] or type name (Enter to cancel)",
+        style="dim italic",
+    )
 
     console.print(
         Panel(
@@ -1060,7 +1053,9 @@ async def prompt_model_switch_dialog(
     )
 
     try:
-        sel = console.input(f"[bold white]Select model [1-{len(gemini_models)}] or name: [/bold white]").strip()
+        sel = console.input(
+            f"[bold white]Select model [1-{len(gemini_models)}] or name: [/bold white]"
+        ).strip()
         if not sel:
             return None
         if sel.isdigit():
@@ -1240,7 +1235,9 @@ _LATEX_SYMBOL_MAP: dict[str, str] = {
 }
 
 _SUPERSCRIPT_MAP = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
-_SUBSCRIPT_MAP = str.maketrans("0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
+_SUBSCRIPT_MAP = str.maketrans(
+    "0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ"
+)
 
 _LATEX_CMD_RE = re.compile(r"\\([A-Za-z]+)")
 _INLINE_CODE_SPLIT_RE = re.compile(r"(`[^`]+`)")
@@ -1255,6 +1252,7 @@ def _convert_latex_expr(expr: str) -> str:
     out = expr.strip()
     # Unwrap common text/style wrappers like \text{...}, \mathrm{...}, \mathbf{...}
     out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname|bf|rm)\{([^{}]*)\}", r"\1", out)
+
     # \frac{a}{b} -> a/b or (a)/(b)
     def _replace_frac(m: re.Match[str]) -> str:
         num, den = m.group(1).strip(), m.group(2).strip()
@@ -1624,7 +1622,7 @@ async def _run_interactive_session(
     code_graph_indexer = CodeGraphIndexer(client.code_graph_store)
     hybrid_search_engine = get_hybrid_search_engine()
     try:
-        code_graph_indexer.index_directory(".", project_key=project_key)
+        code_graph_indexer.index_directory(".", project_key=project_key, max_files=None)
         await hybrid_search_engine.index_directory(".", project_key=project_key)
     except Exception:
         pass
@@ -1846,7 +1844,9 @@ async def _run_interactive_session(
                     f"[bold {style}]✔ Autonomous mode {state}[/bold {style}]. Use [bold]/auto on[/bold] or [bold]/auto off[/bold] to set explicitly."
                 )
             else:
-                console.print("[dim]Usage: [bold]/auto[/bold] (toggle) or [bold]/auto on|off[/bold][/dim]")
+                console.print(
+                    "[dim]Usage: [bold]/auto[/bold] (toggle) or [bold]/auto on|off[/bold][/dim]"
+                )
             continue
 
         if user_input in ("/sessions", "/session list"):
@@ -1997,7 +1997,9 @@ async def _run_interactive_session(
             with console.status(
                 "[bold cyan]Indexing workspace AST symbols & hybrid search chunks...[/bold cyan]"
             ):
-                indexed_count = code_graph_indexer.index_directory(".", project_key=project_key)
+                indexed_count = code_graph_indexer.index_directory(
+                    ".", project_key=project_key, max_files=None
+                )
                 search_chunks = await hybrid_search_engine.index_directory(
                     ".", project_key=project_key
                 )
@@ -2012,7 +2014,9 @@ async def _run_interactive_session(
             query = parts[1].strip() if len(parts) > 1 else ""
             if not query:
                 try:
-                    query = console.input("[bold white]Enter code search query: [/bold white]").strip()
+                    query = console.input(
+                        "[bold white]Enter code search query: [/bold white]"
+                    ).strip()
                 except (KeyboardInterrupt, EOFError):
                     continue
                 if not query:
@@ -2266,7 +2270,11 @@ async def _run_interactive_session(
                 if not tdd_target:
                     continue
 
-            test_cmd = tdd_target if ("pytest" in tdd_target or "python" in tdd_target) else f"pytest {tdd_target}"
+            test_cmd = (
+                tdd_target
+                if ("pytest" in tdd_target or "python" in tdd_target)
+                else f"pytest {tdd_target}"
+            )
             console.print(
                 f"\n[bold magenta]🛠 Initiating Autonomous TDD Repair Loop...[/bold magenta]\n"
                 f"[dim]Reproducing Target: {test_cmd}[/dim]\n"
@@ -2591,7 +2599,9 @@ async def _run_interactive_session(
             summary_items = ", ".join(
                 f"{img.token} ({img.mime_type}, {img.size_label})" for img in attached_images
             )
-            console.print(f"[dim cyan]🖼 Attached {len(attached_images)} image(s): {summary_items}[/dim cyan]")
+            console.print(
+                f"[dim cyan]🖼 Attached {len(attached_images)} image(s): {summary_items}[/dim cyan]"
+            )
             for img in attached_images:
                 user_parts.append(img.to_gemini_part())
 

@@ -218,6 +218,54 @@ class CodeGraphStore:
             )
             conn.commit()
 
+    def remove_stale_files(
+        self,
+        project_key: str,
+        root_dir: Path | str,
+        current_file_paths: set[str],
+    ) -> int:
+        """Atomically removes cached graph rows missing from a complete scan of one root."""
+        root_path = os.path.normpath(str(Path(root_dir).resolve()))
+        current_paths = {
+            os.path.normpath(str(Path(file_path).resolve())) for file_path in current_file_paths
+        }
+        with self._get_connection() as conn:
+            conn.execute(self.storage_engine.migration_transaction_sql)
+            rows = conn.execute(
+                """
+                SELECT file_path FROM code_symbols WHERE project_key = ?
+                UNION SELECT file_path FROM file_metadata WHERE project_key = ?
+                UNION SELECT file_path FROM file_graph_state WHERE project_key = ?
+                """,
+                (project_key, project_key, project_key),
+            ).fetchall()
+            stale_paths: set[str] = set()
+            for row in rows:
+                file_path = os.path.normpath(row["file_path"])
+                try:
+                    inside_root = os.path.commonpath((root_path, file_path)) == root_path
+                except ValueError:
+                    inside_root = False
+                if inside_root and file_path not in current_paths:
+                    stale_paths.add(file_path)
+
+            if stale_paths:
+                parameters = [(project_key, file_path) for file_path in stale_paths]
+                conn.executemany(
+                    "DELETE FROM code_symbols WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+                conn.executemany(
+                    "DELETE FROM file_metadata WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+                conn.executemany(
+                    "DELETE FROM file_graph_state WHERE project_key = ? AND file_path = ?",
+                    parameters,
+                )
+            conn.commit()
+        return len(stale_paths)
+
     def save_file_symbols(
         self,
         project_key: str,
@@ -1331,17 +1379,23 @@ class CodeGraphIndexer:
         self,
         dir_path: Path | str,
         project_key: str | None = None,
-        max_files: int = 500,
+        max_files: int | None = 500,
     ) -> int:
-        """Recursively indexes all supported source files under dir_path, skipping unchanged files via st_mtime."""
+        """Indexes supported files, skipping unchanged mtimes and pruning stale paths after a full scan."""
         root = Path(dir_path).resolve()
         if not root.is_dir():
             return 0
 
         p_key = project_key or resolve_project_key()
         indexed_count = 0
+        scan_complete = True
+        current_file_paths: set[str] = set()
 
-        for current_root, dirs, files in os.walk(root):
+        def mark_scan_incomplete(_error: OSError) -> None:
+            nonlocal scan_complete
+            scan_complete = False
+
+        for current_root, dirs, files in os.walk(root, onerror=mark_scan_incomplete):
             # Prune excluded directories in-place
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
 
@@ -1351,7 +1405,9 @@ class CodeGraphIndexer:
                     try:
                         current_mtime = full_path.stat().st_mtime
                     except OSError:
+                        scan_complete = False
                         continue
+                    current_file_paths.add(str(full_path))
 
                     cached_mtime = self.store.get_file_mtime(p_key, str(full_path))
                     if cached_mtime is not None and cached_mtime == current_mtime:
@@ -1359,7 +1415,9 @@ class CodeGraphIndexer:
 
                     self.index_file(full_path, p_key)
                     indexed_count += 1
-                    if indexed_count >= max_files:
+                    if max_files is not None and indexed_count >= max_files:
                         return indexed_count
 
+        if scan_complete:
+            self.store.remove_stale_files(p_key, root, current_file_paths)
         return indexed_count
