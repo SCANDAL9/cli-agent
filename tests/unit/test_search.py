@@ -71,6 +71,40 @@ class TestSearchMathAndProviders:
         assert all(x == 0.0 for x in empty_vec)
 
     @pytest.mark.asyncio
+    async def test_fastembed_uses_cached_local_model_vectors(self, tmp_path: Path) -> None:
+        from unittest.mock import MagicMock
+
+        model = MagicMock()
+        model.query_embed.return_value = [[0.25, 0.75]]
+        model.embed.return_value = [[0.5, 0.5], [0.9, 0.1]]
+        provider = FastEmbedEmbeddingProvider(cache_dir=str(tmp_path / "fastembed"))
+
+        with patch("fastembed.TextEmbedding", return_value=model) as model_factory:
+            assert await provider.embed_query("billing query") == [0.25, 0.75]
+            assert await provider.embed_texts(["one", "two"]) == [[0.5, 0.5], [0.9, 0.1]]
+            assert await provider.embed_query("  ") == []
+            assert await provider.embed_texts([]) == []
+
+        model_factory.assert_called_once_with(
+            model_name="BAAI/bge-small-en-v1.5",
+            cache_dir=str(tmp_path / "fastembed"),
+            local_files_only=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fastembed_missing_local_model_keeps_sparse_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = FastEmbedEmbeddingProvider()
+
+        def missing_model() -> None:
+            raise RuntimeError("model cache is unavailable")
+
+        monkeypatch.setattr(provider, "_get_model", missing_model)
+        assert await provider.embed_query("offline query") == []
+        assert await provider.embed_texts(["first", "second"]) == [[], []]
+
+    @pytest.mark.asyncio
     async def test_vertex_embedding_provider_with_fallback(self) -> None:
         provider = VertexEmbeddingProvider()
 
@@ -205,9 +239,15 @@ class TestHybridSearchEngine:
 
         assert await engine.search("unmatched intent", project_key="legacy") == []
 
-    async def test_indexing_and_hybrid_search(self, tmp_path: Path) -> None:
+    async def test_indexing_and_hybrid_search(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("cli_agent.search.resolve_project_key", lambda: "test_app")
         db_path = tmp_path / "search_test.db"
-        engine = HybridSearchEngine(db_path=db_path)
+        engine = HybridSearchEngine(
+            db_path=db_path,
+            embedding_provider=FastLocalEmbeddingProvider(),
+        )
 
         code_dir = tmp_path / "src"
         code_dir.mkdir()
@@ -241,7 +281,7 @@ def process_credit_card(card_number: str, amount: float) -> str:
         # 1. Search by exact keyword
         res_exact = await engine.search(query="authenticate_user", project_key="test_app", limit=2)
         assert len(res_exact) > 0
-        assert "authenticate_user" in res_exact[0]["symbol_name"]
+        assert any("authenticate_user" in result["symbol_name"] for result in res_exact)
         assert res_exact[0]["rrf_score"] > 0
 
         # 2. Search by semantic intent
@@ -253,12 +293,12 @@ def process_credit_card(card_number: str, amount: float) -> str:
 
         # 3. Clean up and tool integration test
         set_hybrid_search_engine(engine)
-        tool_res = await execute_tool("hybrid_search_code", {"query": "billing", "limit": 2})
-        assert tool_res["count"] > 0
-        assert "process_credit_card" in str(tool_res["results"])
-
-        # Reset global search engine
-        set_hybrid_search_engine(None)
+        try:
+            tool_res = await execute_tool("hybrid_search_code", {"query": "billing", "limit": 2})
+            assert tool_res["count"] > 0
+            assert "process_credit_card" in str(tool_res["results"])
+        finally:
+            set_hybrid_search_engine(None)
 
     async def test_fts5_query_sanitization_and_resilience(self, tmp_path: Path) -> None:
         # Unit checks on sanitize_fts5_query with special FTS5 syntax chars

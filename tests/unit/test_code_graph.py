@@ -705,6 +705,100 @@ class TestCodeGraphStore:
 
 @pytest.mark.unit
 class TestCodeGraphIndexer:
+    def test_indexer_extracts_polyglot_symbols_and_dependency_edges(
+        self,
+        temp_indexer: CodeGraphIndexer,
+        temp_graph_store: CodeGraphStore,
+        tmp_path: Path,
+    ) -> None:
+        sources = {
+            "billing.ts": """// Billing service
+export class BillingService extends BaseService {
+  public charge(invoice: Invoice): Result {
+    return send(invoice);
+  }
+}
+export async function processPayment(amount: number): Promise<Result> {
+  return authorize(amount);
+}
+export const handlePayment = (amount: number): number => {
+  return convert(amount);
+};
+""",
+            "billing.go": """// Billing store
+type BillingStore struct {
+}
+func ProcessPayment(amount float64) bool {
+    return authorize(amount)
+}
+func (store *BillingStore) Save(amount float64) bool {
+    return persist(amount)
+}
+""",
+            "billing.rs": """/// Payment store
+pub struct PaymentStore {
+}
+pub trait Writer {
+}
+impl Writer for PaymentStore {
+    pub async fn save(item: Item) -> bool {
+        persist(item);
+    }
+}
+pub fn dispatch(item: Item) {
+    send(item);
+}
+""",
+        }
+        paths = [tmp_path / filename for filename in sources]
+        for path, source in zip(paths, sources.values(), strict=True):
+            path.write_text(source, encoding="utf-8")
+
+        assert [temp_indexer.index_file(path, "polyglot") for path in paths] == [4, 3, 5]
+        symbols = {
+            row["symbol_name"]
+            for path in paths
+            for row in temp_graph_store.get_file_symbols("polyglot", str(path.resolve()))
+        }
+        assert {
+            "BillingService",
+            "BillingService.charge",
+            "processPayment",
+            "handlePayment",
+            "BillingStore",
+            "ProcessPayment",
+            "BillingStore.Save",
+            "PaymentStore",
+            "Writer",
+            "PaymentStore.save",
+            "dispatch",
+        } <= symbols
+
+        with temp_graph_store._get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT source.symbol_name, edge.target_symbol_name, edge.relationship_type
+                FROM symbol_edges AS edge
+                JOIN code_symbols AS source ON source.id = edge.source_symbol_id
+                WHERE source.project_key = ?
+                """,
+                ("polyglot",),
+            ).fetchall()
+        edges = {
+            (row["symbol_name"], row["target_symbol_name"], row["relationship_type"])
+            for row in rows
+        }
+        assert {
+            ("BillingService", "BaseService", "inherits"),
+            ("BillingService.charge", "send", "calls"),
+            ("processPayment", "authorize", "calls"),
+            ("handlePayment", "convert", "calls"),
+            ("BillingStore.Save", "persist", "calls"),
+            ("PaymentStore", "Writer", "inherits"),
+            ("PaymentStore.save", "persist", "calls"),
+            ("dispatch", "send", "calls"),
+        } <= edges
+
     def test_parse_python_source_preserves_nested_call_edge_order(
         self, temp_indexer: CodeGraphIndexer
     ) -> None:
