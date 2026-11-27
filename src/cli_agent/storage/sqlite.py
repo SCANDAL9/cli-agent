@@ -8,15 +8,22 @@ from pathlib import Path
 from typing import Any
 
 from .base import StorageConnection, quote_identifier
+from .synchronous import configure_synchronous, normalize_synchronous_mode
 
 
 class SQLiteEngine:
     fts_dialect = "fts5"
     migration_transaction_sql = "BEGIN IMMEDIATE"
 
-    def __init__(self, database_path: Path | str, busy_timeout_ms: int = 30_000) -> None:
+    def __init__(
+        self,
+        database_path: Path | str,
+        busy_timeout_ms: int = 30_000,
+        synchronous: str = "FULL",
+    ) -> None:
         self.database_path = Path(database_path).expanduser()
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+        self.synchronous = normalize_synchronous_mode(synchronous)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -32,6 +39,7 @@ class SQLiteEngine:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA journal_mode = WAL")
+        configure_synchronous(connection, self.synchronous)
         return StorageConnection(connection)
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[dict[str, Any]]:

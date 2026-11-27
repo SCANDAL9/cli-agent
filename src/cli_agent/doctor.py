@@ -23,7 +23,7 @@ async def run_diagnostics(
     """
     tp = token_provider or TokenProvider()
     mem = memory_store or MemoryStore()
-    cgs = code_graph_store or CodeGraphStore(storage_engine=mem.storage_engine)
+    cgs = code_graph_store or CodeGraphStore()
 
     results: dict[str, Any] = {
         "token_status": "unknown",

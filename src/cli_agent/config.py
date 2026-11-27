@@ -69,6 +69,7 @@ class StorageConfig:
     turso_mode: str = "replica"
     sync_interval: float = 30.0
     replica_path: Path | None = None
+    synchronous: str = "FULL"
 
 
 def load_storage_config(config_path: Path | None = None) -> StorageConfig:

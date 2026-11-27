@@ -1,7 +1,7 @@
 """
 Tree-sitter AST & Code Intelligence Graph for cli-agent.
 Extracts symbols (classes, functions, methods), signatures, docstrings, and relationships
-(calls, inheritance, imports) into a persistent SQLite knowledge graph.
+(calls, inheritance, imports) into a rebuildable Turso graph cache.
 """
 
 import hashlib
@@ -29,6 +29,7 @@ PY_CALL_QUERY = Query(
 )
 
 SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"}
+DEFAULT_CODE_GRAPH_DB_PATH = DEFAULT_DB_PATH.with_name("code_graph.db")
 
 
 def _node_text(node: Node | None) -> str:
@@ -74,7 +75,7 @@ class SymbolEdge:
 
 
 class CodeGraphStore:
-    """Persistent SQLite store for AST code symbols and dependency graph edges."""
+    """Persistent Turso cache for AST code symbols and dependency graph edges."""
 
     def __init__(
         self,
@@ -83,13 +84,25 @@ class CodeGraphStore:
         storage_engine: StorageEngine | None = None,
         storage_config: StorageConfig | None = None,
     ):
-        self.storage_engine = resolve_store_engine(
-            DEFAULT_DB_PATH,
-            Path(db_path) if db_path is not None else None,
-            storage_engine,
-            storage_config,
-        )
-        self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+        if storage_engine is None and db_path is None:
+            self.db_path = DEFAULT_CODE_GRAPH_DB_PATH
+            graph_storage_config = storage_config or StorageConfig(
+                backend="turso",
+                replica_path=self.db_path,
+                synchronous="NORMAL",
+            )
+            self.storage_engine = resolve_store_engine(
+                self.db_path,
+                storage_config=graph_storage_config,
+            )
+        else:
+            self.storage_engine = resolve_store_engine(
+                DEFAULT_DB_PATH,
+                Path(db_path) if db_path is not None else None,
+                storage_engine,
+                storage_config,
+            )
+            self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import StorageBackendUnavailable, StorageConnection, quote_identifier
+from .synchronous import configure_synchronous, normalize_synchronous_mode
 
 
 class TursoEngine:
@@ -24,6 +25,7 @@ class TursoEngine:
         auth_token: str,
         sync_interval: float = 30.0,
         mode: str = "replica",
+        synchronous: str = "FULL",
     ) -> None:
         if not remote_url or not auth_token:
             raise ValueError("Turso requires both a database URL and an authentication token.")
@@ -43,6 +45,7 @@ class TursoEngine:
         self.remote_url = remote_url
         self._auth_token = auth_token
         self.sync_interval = float(sync_interval)
+        self.synchronous = normalize_synchronous_mode(synchronous)
         self._connection: Any | None = None
         self._lock = threading.RLock()
 
@@ -70,6 +73,7 @@ class TursoEngine:
                 )
                 connection.sync()
             connection.execute("PRAGMA foreign_keys = ON")
+            configure_synchronous(connection, self.synchronous)
         except Exception as exc:
             raise StorageBackendUnavailable(
                 "Unable to initialize the Turso embedded replica."
@@ -157,9 +161,10 @@ class TursoLocalEngine:
     fts_dialect = "turso"
     migration_transaction_sql = "BEGIN"
 
-    def __init__(self, database_path: Path | str) -> None:
+    def __init__(self, database_path: Path | str, synchronous: str = "FULL") -> None:
         self.database_path = Path(database_path).expanduser()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.synchronous = normalize_synchronous_mode(synchronous)
         self._connection: Any | None = None
         self._lock = threading.RLock()
 
@@ -181,6 +186,7 @@ class TursoLocalEngine:
                 experimental_features="index_method",
             )
             connection.execute("PRAGMA foreign_keys = ON")
+            configure_synchronous(connection, self.synchronous)
             return connection
         except Exception as exc:
             raise StorageBackendUnavailable(

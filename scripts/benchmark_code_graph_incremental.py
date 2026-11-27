@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Compare durable single-file code-graph updates on local Turso and SQLite.
+"""Compare rebuildable graph-cache updates on local Turso and SQLite.
 
 Run from the repository root with:
     PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py
     PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py --edge-density dense
     PYTHONPATH=src .venv/bin/python scripts/benchmark_code_graph_incremental.py --edge-density dense --source-index off
 
-All databases and generated source files live in a temporary directory. The
-probe uses identical workloads per backend and reports candidate/source hashes
-so measurements can be tied to the exact code that was tested.
+Both backends use WAL NORMAL for an equivalent rebuildable-cache durability
+profile. All databases and generated source files live in a temporary directory.
+The probe uses identical workloads per backend and reports candidate/source
+hashes so measurements can be tied to the exact code that was tested.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ INITIAL_FILES = 500
 SYMBOLS_PER_FILE = 50
 MODIFICATIONS_PER_TRIAL = 40
 CREATES_PER_TRIAL = 20
-TRIALS = 3
+TRIALS = 5
 
 
 def _source(
@@ -131,7 +132,11 @@ def _run_trial(
         path.write_text(_source(index, dense=edge_density == "dense"), encoding="utf-8")
 
     database_path = trial_root / "graph.db"
-    engine = TursoLocalEngine(database_path) if backend == "turso" else SQLiteEngine(database_path)
+    engine = (
+        TursoLocalEngine(database_path, synchronous="NORMAL")
+        if backend == "turso"
+        else SQLiteEngine(database_path, synchronous="NORMAL")
+    )
     store = CodeGraphStore(database_path, storage_engine=engine)
     indexer = CodeGraphIndexer(store)
     if source_index == "off":
@@ -252,6 +257,7 @@ def _run_backend(
         del trial["_persistence_ms"]
     return {
         "backend": backend,
+        "synchronous": "NORMAL",
         "edge_density": edge_density,
         "source_index": source_index,
         "aggregate": aggregate,

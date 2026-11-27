@@ -53,6 +53,17 @@ def test_sqlite_engine_executes_rows_many_and_transactions(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_sqlite_engine_applies_synchronous_mode_to_each_connection(tmp_path: Path):
+    engine = SQLiteEngine(tmp_path / "synchronous.db", synchronous="NORMAL")
+
+    for _ in range(2):
+        with engine.connect() as connection:
+            assert int(connection.execute("PRAGMA synchronous").fetchone()[0]) == 1
+
+    engine.close()
+
+
+@pytest.mark.unit
 def test_sqlite_engine_creates_parameterized_fts5_tables(tmp_path: Path):
     engine = SQLiteEngine(tmp_path / "fts.db")
     engine.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")

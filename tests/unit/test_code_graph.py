@@ -2,17 +2,21 @@
 Unit tests for the Tree-sitter AST & Code Intelligence Graph module.
 """
 
+import os
 from pathlib import Path
 
 import pytest
 
+from cli_agent import code_graph, config
 from cli_agent.code_graph import (
     CodeGraphIndexer,
     CodeGraphStore,
     CodeSymbol,
     SymbolEdge,
 )
+from cli_agent.config import StorageConfig
 from cli_agent.storage.base import StorageConnection
+from cli_agent.storage.factory import clear_storage_engine_cache, create_storage_engine
 from cli_agent.storage.sqlite import SQLiteEngine
 from cli_agent.storage.turso import TursoLocalEngine
 from cli_agent.tools import (
@@ -37,6 +41,80 @@ def temp_indexer(temp_graph_store: CodeGraphStore) -> CodeGraphIndexer:
 
 @pytest.mark.unit
 class TestCodeGraphStore:
+    def test_default_graph_uses_isolated_normal_turso_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        legacy_path = tmp_path / "memory.db"
+        graph_path = tmp_path / "code_graph.db"
+        app_replica_path = tmp_path / "memory.turso.db"
+        legacy = SQLiteEngine(legacy_path)
+        legacy.execute("CREATE TABLE durable_marker (id INTEGER PRIMARY KEY, value TEXT)")
+        legacy.execute("INSERT INTO durable_marker (value) VALUES (?)", ("preserve",))
+        legacy.close()
+
+        monkeypatch.setattr(code_graph, "DEFAULT_DB_PATH", legacy_path)
+        monkeypatch.setattr(code_graph, "DEFAULT_CODE_GRAPH_DB_PATH", graph_path, raising=False)
+        monkeypatch.setattr(config, "DEFAULT_CONFIG_FILE", tmp_path / "missing-config.toml")
+        monkeypatch.setenv("CLI_AGENT_STORAGE_BACKEND", "turso")
+        monkeypatch.setenv("TURSO_MODE", "replica")
+        monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+        monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("TURSO_REPLICA_PATH", raising=False)
+
+        app_engine = create_storage_engine(
+            legacy_path,
+            StorageConfig(backend="turso", replica_path=app_replica_path),
+        )
+        graph_store = CodeGraphStore()
+        try:
+            assert graph_store.db_path == graph_path
+            assert graph_store.storage_engine.local_database_path == graph_path
+
+            with graph_store._get_connection() as connection:
+                graph_sync = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+                copied_tables = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'durable_marker'"
+                ).fetchall()
+            with app_engine.connect() as connection:
+                app_sync = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+                app_rows = connection.execute("SELECT value FROM durable_marker").fetchall()
+
+            assert graph_sync == 1
+            assert copied_tables == []
+            assert app_sync == 2
+            assert [row["value"] for row in app_rows] == ["preserve"]
+        finally:
+            app_engine.close()
+            clear_storage_engine_cache()
+
+    def test_normal_graph_reindexes_changed_source_after_restart(self, tmp_path: Path) -> None:
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        source_file = source_dir / "sample.py"
+        source_file.write_text("def before_restart():\n    return 1\n", encoding="utf-8")
+        graph_path = tmp_path / "code_graph.db"
+        graph_config = StorageConfig(
+            backend="turso",
+            replica_path=graph_path,
+            synchronous="NORMAL",
+        )
+
+        first_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        first_indexer = CodeGraphIndexer(first_store)
+        assert first_indexer.index_directory(source_dir, project_key="restart") == 1
+        clear_storage_engine_cache()
+
+        previous_mtime = source_file.stat().st_mtime
+        source_file.write_text("def after_restart():\n    return 2\n", encoding="utf-8")
+        os.utime(source_file, (previous_mtime + 2.0, previous_mtime + 2.0))
+
+        reopened_store = CodeGraphStore(db_path=graph_path, storage_config=graph_config)
+        reopened_indexer = CodeGraphIndexer(reopened_store)
+        assert reopened_indexer.index_directory(source_dir, project_key="restart") == 1
+        assert reopened_store.find_definition("restart", "before_restart") == []
+        assert reopened_store.find_definition("restart", "after_restart")
+        clear_storage_engine_cache()
+
     def test_schema_indexes_edges_by_source_symbol(self, tmp_path: Path) -> None:
         backends = (
             ("turso", TursoLocalEngine),
