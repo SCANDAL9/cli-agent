@@ -57,6 +57,9 @@ class SecurityPolicy:
 
     def evaluate_risk(self, tool_name: str, arguments: dict[str, Any]) -> RiskLevel:
         """Classifies tool invocation into SAFE, MEDIUM, or HIGH risk."""
+        if tool_name == "apply_worker_diff":
+            return RiskLevel.HIGH
+
         if tool_name == "run_wasm_plugin":
             capability_fields = (
                 "read_dirs",
@@ -192,6 +195,25 @@ class SecurityPolicy:
         self._session_allowlist.add(cache_key)
 
     def _get_cache_key(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        if tool_name == "apply_worker_diff":
+            diff = arguments.get("diff")
+            if isinstance(diff, str):
+                diff_bytes = diff.encode("utf-8")
+            elif isinstance(diff, bytes):
+                diff_bytes = diff
+            else:
+                diff_bytes = repr(diff).encode("utf-8")
+            diff_hash = hashlib.sha256(diff_bytes).hexdigest()
+            return (
+                "apply_worker_diff:"
+                f"{arguments.get('task_id', '')}:"
+                f"{arguments.get('worker_id', '')}:"
+                f"{arguments.get('lease_id', '')}:"
+                f"{arguments.get('generation', '')}:"
+                f"{arguments.get('diff_sha256', '')}:"
+                f"{diff_hash}"
+            )
+
         if tool_name == "run_wasm_plugin":
 
             def normalized_values(name: str) -> list[str]:

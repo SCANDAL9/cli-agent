@@ -225,3 +225,27 @@ def test_command_sandbox_grants_require_high_risk_approval_without_widening_allo
     assert policy.check_permission("run_command", ordinary)[0] is True
     assert policy.check_permission("run_command", network_grant)[0] is False
     assert policy.check_permission("run_command", fallback_grant)[0] is False
+
+
+def test_worker_diff_permission_is_high_risk_and_bound_to_exact_content_hash():
+    original = {
+        "task_id": "task-1",
+        "worker_id": "worker-1",
+        "lease_id": "lease-1",
+        "generation": 4,
+        "diff_sha256": "a" * 64,
+        "diff": "first patch",
+    }
+    policy = SecurityPolicy(auto_approve=True)
+
+    assert policy.evaluate_risk("apply_worker_diff", original) == RiskLevel.HIGH
+    assert policy.check_permission("apply_worker_diff", original)[0] is False
+
+    policy.grant_session_permission("apply_worker_diff", original)
+    assert policy.check_permission("apply_worker_diff", original)[0] is True
+    assert (
+        policy.check_permission(
+            "apply_worker_diff", {**original, "diff_sha256": "b" * 64, "diff": "second patch"}
+        )[0]
+        is False
+    )
