@@ -91,6 +91,8 @@ class SecurityPolicy:
             return RiskLevel.MEDIUM
 
         if tool_name in {"run_command", "start_background_process"}:
+            if arguments.get("network_access") or arguments.get("allow_reduced_isolation"):
+                return RiskLevel.HIGH
             cmd = arguments.get("command", "")
             for pattern in COMPILED_HIGH_RISK:
                 if pattern.search(cmd):
@@ -176,9 +178,20 @@ class SecurityPolicy:
         self._session_allowlist.add(cache_key)
 
     def _get_cache_key(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        capability_suffix = ""
+        if tool_name in {"run_command", "start_background_process"}:
+            network_access = bool(arguments.get("network_access"))
+            reduced_isolation = bool(arguments.get("allow_reduced_isolation"))
+            if network_access or reduced_isolation:
+                capability_suffix = (
+                    f":network={int(network_access)}:reduced-isolation={int(reduced_isolation)}"
+                )
         if tool_name == "run_command":
             cmd = arguments.get("command", "").strip()
             # Cache the base command name (e.g. pytest, git status)
-            return f"run_command:{cmd}"
+            return f"run_command:{cmd}{capability_suffix}"
+        if tool_name == "start_background_process" and capability_suffix:
+            cmd = arguments.get("command", "").strip()
+            return f"start_background_process:{cmd}{capability_suffix}"
         path = arguments.get("path", "").strip()
-        return f"{tool_name}:{path}"
+        return f"{tool_name}:{path}{capability_suffix}"

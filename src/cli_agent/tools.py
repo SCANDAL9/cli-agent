@@ -8,9 +8,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -18,11 +20,19 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .code_graph import SUPPORTED_EXTENSIONS, CodeGraphIndexer, CodeGraphStore
 from .memory import MemoryStore, resolve_project_key
+from .sandbox import (
+    SandboxUnavailableError,
+    build_bwrap_argv,
+    build_bwrap_probe_argv,
+    reduced_shell_argv,
+    sandbox_environment,
+)
 
 memory_store = MemoryStore()
 code_graph_store = CodeGraphStore()
@@ -46,6 +56,7 @@ class BackgroundProcessEntry:
     process: subprocess.Popen[str]
     log_path: Path
     started_at: float
+    sandbox_temp_dir: Path | None = None
 
 
 _background_processes: dict[str, BackgroundProcessEntry] = {}
@@ -1123,28 +1134,144 @@ def _window_command_output(
 
 
 def _build_safe_env() -> dict[str, str]:
-    """Constructs a sanitized environment dictionary for subprocess execution."""
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    return env
+    """Constructs a minimal environment that does not forward host credentials."""
+    return sandbox_environment(home="/tmp")
 
 
-def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60) -> dict[str, Any]:
-    """Executes a bash shell command with head-tail output windowing, secret redaction, and timeout protections."""
+@lru_cache(maxsize=1)
+def _bwrap_available() -> bool:
+    """Checks whether bubblewrap can create the namespaces required by this policy."""
+    if sys.platform != "linux":
+        return False
+    bwrap_path = shutil.which("bwrap")
+    shell_path = shutil.which("bash")
+    if not bwrap_path or not shell_path:
+        return False
+    try:
+        subprocess.run(
+            build_bwrap_probe_argv(bwrap_path=bwrap_path, shell_path=shell_path),
+            check=True,
+            capture_output=True,
+            env=_build_safe_env(),
+            shell=False,
+            timeout=5,
+            text=True,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError, SandboxUnavailableError):
+        return False
+
+
+def _find_workspace_root(path: Path) -> Path:
+    """Returns the nearest project root without widening a non-project cwd."""
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return path
+
+
+def _prepare_shell_execution(
+    command: str,
+    *,
+    work_dir: Path,
+    workspace: Path,
+    network_access: bool,
+    allow_reduced_isolation: bool,
+    sanitized_git_config: Path,
+) -> tuple[list[str], dict[str, str], str, str | None]:
+    bwrap_path = shutil.which("bwrap")
+    shell_path = shutil.which("bash")
+    if bwrap_path and shell_path and _bwrap_available():
+        return (
+            build_bwrap_argv(
+                command,
+                bwrap_path=bwrap_path,
+                shell_path=shell_path,
+                workspace=workspace,
+                cwd=work_dir,
+                network_access=network_access,
+                sanitized_git_config=sanitized_git_config,
+            ),
+            _build_safe_env(),
+            "os",
+            None,
+        )
+
+    if not allow_reduced_isolation:
+        raise SandboxUnavailableError(
+            "OS isolation is unavailable; command execution is blocked by default."
+        )
+    if not network_access:
+        raise SandboxUnavailableError(
+            "The reduced-isolation fallback cannot enforce network isolation; "
+            "network_access must be explicitly approved to use it."
+        )
+    if not shell_path:
+        raise SandboxUnavailableError("A POSIX shell is unavailable for reduced-isolation mode.")
+    return (
+        reduced_shell_argv(shell_path=shell_path, command=command),
+        sandbox_environment(home="/tmp"),
+        "reduced",
+        "Reduced isolation: this fallback does not provide OS process isolation or filesystem isolation.",
+    )
+
+
+def _command_workspace(work_dir: Path, active_sandbox: Path | None) -> Path:
+    return active_sandbox.resolve() if active_sandbox else _find_workspace_root(work_dir.resolve())
+
+
+def _new_sandbox_runtime_dir() -> Path:
+    runtime_dir = Path(tempfile.mkdtemp(prefix="cli-agent-sandbox-", dir="/tmp"))
+    sanitized_git_config = runtime_dir / "git-config"
+    sanitized_git_config.write_text("", encoding="utf-8")
+    sanitized_git_config.chmod(0o444)
+    return runtime_dir
+
+
+def _cleanup_sandbox_runtime_dir(runtime_dir: Path | None) -> None:
+    if runtime_dir is not None:
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def _cleanup_background_sandbox(entry: BackgroundProcessEntry) -> None:
+    _cleanup_sandbox_runtime_dir(entry.sandbox_temp_dir)
+    entry.sandbox_temp_dir = None
+
+
+def run_command(
+    command: str,
+    cwd: str | None = None,
+    timeout_seconds: int = 60,
+    network_access: bool = False,
+    allow_reduced_isolation: bool = False,
+) -> dict[str, Any]:
+    """Executes a command in OS isolation, returning bounded and redacted output."""
+    isolation = "unavailable"
+    runtime_dir: Path | None = None
     try:
         active_sandbox = _active_sandbox_var.get()
         default_dir = active_sandbox or Path.cwd().resolve()
         work_dir = _resolve_tool_path(cwd) if cwd else default_dir
-        if active_sandbox and not str(work_dir).startswith(str(active_sandbox)):
+        if active_sandbox and not work_dir.is_relative_to(active_sandbox.resolve()):
             return {
-                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'."
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'.",
+                "isolation": "unavailable",
             }
-        proc = subprocess.run(
+        workspace = _command_workspace(work_dir, active_sandbox)
+        runtime_dir = _new_sandbox_runtime_dir()
+        args, env, isolation, warning = _prepare_shell_execution(
             command,
-            shell=True,
+            work_dir=work_dir,
+            workspace=workspace,
+            network_access=network_access,
+            allow_reduced_isolation=allow_reduced_isolation,
+            sanitized_git_config=runtime_dir / "git-config",
+        )
+        proc = subprocess.run(
+            args,
+            shell=False,
             cwd=work_dir,
-            env=_build_safe_env(),
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -1155,28 +1282,58 @@ def run_command(command: str, cwd: str | None = None, timeout_seconds: int = 60)
         stdout, stdout_trunc = _window_command_output(raw_stdout)
         stderr, stderr_trunc = _window_command_output(raw_stderr)
 
-        return {
+        result = {
             "exit_code": proc.returncode,
             "stdout": stdout,
             "stderr": stderr,
             "truncated": stdout_trunc or stderr_trunc,
+            "isolation": isolation,
         }
+        if warning:
+            result["warning"] = warning
+        return result
+    except SandboxUnavailableError as e:
+        return {"error": str(e), "isolation": "unavailable"}
     except subprocess.TimeoutExpired:
-        return {"error": f"Command timed out after {timeout_seconds} seconds."}
+        return {
+            "error": f"Command timed out after {timeout_seconds} seconds.",
+            "isolation": isolation,
+        }
     except Exception as e:
-        return {"error": f"Command execution failed: {str(e)}"}
+        return {"error": f"Command execution failed: {str(e)}", "isolation": isolation}
+    finally:
+        _cleanup_sandbox_runtime_dir(runtime_dir)
 
 
-def start_background_process(command: str, cwd: str | None = None) -> dict[str, Any]:
+def start_background_process(
+    command: str,
+    cwd: str | None = None,
+    network_access: bool = False,
+    allow_reduced_isolation: bool = False,
+) -> dict[str, Any]:
     """Spawns a non-blocking background process (e.g., dev server, watcher) and streams output to a log file."""
+    isolation = "unavailable"
+    runtime_dir: Path | None = None
+    preserve_runtime_dir = False
     try:
         active_sandbox = _active_sandbox_var.get()
         default_dir = active_sandbox or Path.cwd().resolve()
         work_dir = _resolve_tool_path(cwd) if cwd else default_dir
-        if active_sandbox and not str(work_dir).startswith(str(active_sandbox)):
+        if active_sandbox and not work_dir.is_relative_to(active_sandbox.resolve()):
             return {
-                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'."
+                "error": f"Sandbox security violation: cwd '{work_dir}' is outside active sandbox '{active_sandbox}'.",
+                "isolation": "unavailable",
             }
+        workspace = _command_workspace(work_dir, active_sandbox)
+        runtime_dir = _new_sandbox_runtime_dir()
+        args, env, isolation, warning = _prepare_shell_execution(
+            command,
+            work_dir=work_dir,
+            workspace=workspace,
+            network_access=network_access,
+            allow_reduced_isolation=allow_reduced_isolation,
+            sanitized_git_config=runtime_dir / "git-config",
+        )
 
         job_id = f"bg-{uuid.uuid4().hex[:8]}"
         log_dir = Path("/tmp/cli-agent/bg_logs")
@@ -1185,10 +1342,10 @@ def start_background_process(command: str, cwd: str | None = None) -> dict[str, 
 
         log_file = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            args,
+            shell=False,
             cwd=work_dir,
-            env=_build_safe_env(),
+            env=env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1201,18 +1358,29 @@ def start_background_process(command: str, cwd: str | None = None) -> dict[str, 
             process=proc,
             log_path=log_path,
             started_at=time.time(),
+            sandbox_temp_dir=runtime_dir if isolation == "os" else None,
         )
         _background_processes[job_id] = entry
-        return {
+        preserve_runtime_dir = isolation == "os"
+        result = {
             "status": "started",
             "job_id": job_id,
             "pid": proc.pid,
             "command": command,
             "cwd": str(work_dir),
             "log_path": str(log_path),
+            "isolation": isolation,
         }
+        if warning:
+            result["warning"] = warning
+        return result
+    except SandboxUnavailableError as e:
+        return {"error": str(e), "isolation": "unavailable"}
     except Exception as e:
-        return {"error": f"Failed starting background process: {str(e)}"}
+        return {"error": f"Failed starting background process: {str(e)}", "isolation": isolation}
+    finally:
+        if not preserve_runtime_dir:
+            _cleanup_sandbox_runtime_dir(runtime_dir)
 
 
 def check_background_process(job_id: str, tail_lines: int = 100) -> dict[str, Any]:
@@ -1223,6 +1391,8 @@ def check_background_process(job_id: str, tail_lines: int = 100) -> dict[str, An
 
     ret_code = entry.process.poll()
     running = ret_code is None
+    if not running:
+        _cleanup_background_sandbox(entry)
     raw_logs = ""
     if entry.log_path.exists():
         try:
@@ -1267,6 +1437,7 @@ def stop_background_process(job_id: str) -> dict[str, Any]:
             entry.process.terminate()
 
     final_code = entry.process.poll()
+    _cleanup_background_sandbox(entry)
     return {
         "status": "stopped",
         "job_id": job_id,
@@ -1637,7 +1808,7 @@ GEMINI_TOOLS_DECLARATIONS = [
     },
     {
         "name": "run_command",
-        "description": "Runs a shell command (e.g. pytest, git status, linters) and returns stdout and stderr.",
+        "description": "Runs a shell command in an OS sandbox by default. Network access and reduced-isolation fallback require explicit high-risk approval.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -1649,6 +1820,14 @@ GEMINI_TOOLS_DECLARATIONS = [
                 "timeout_seconds": {
                     "type": "INTEGER",
                     "description": "Maximum seconds to wait (default: 60).",
+                },
+                "network_access": {
+                    "type": "BOOLEAN",
+                    "description": "Allow network access; disabled by default and requires high-risk approval.",
+                },
+                "allow_reduced_isolation": {
+                    "type": "BOOLEAN",
+                    "description": "Allow a non-OS-isolated fallback only when Bubblewrap is unavailable; requires high-risk approval and network_access=true.",
                 },
             },
             "required": ["command"],
@@ -1740,7 +1919,7 @@ GEMINI_TOOLS_DECLARATIONS = [
     },
     {
         "name": "start_background_process",
-        "description": "Starts a non-blocking background process (such as a dev server or watcher) and returns its job_id.",
+        "description": "Starts a background process in an OS sandbox by default. Network access and reduced-isolation fallback require explicit high-risk approval.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -1749,6 +1928,14 @@ GEMINI_TOOLS_DECLARATIONS = [
                     "description": "Shell command to run in the background.",
                 },
                 "cwd": {"type": "STRING", "description": "Optional working directory."},
+                "network_access": {
+                    "type": "BOOLEAN",
+                    "description": "Allow network access; disabled by default and requires high-risk approval.",
+                },
+                "allow_reduced_isolation": {
+                    "type": "BOOLEAN",
+                    "description": "Allow a non-OS-isolated fallback only when Bubblewrap is unavailable; requires high-risk approval and network_access=true.",
+                },
             },
             "required": ["command"],
         },

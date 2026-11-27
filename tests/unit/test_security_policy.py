@@ -185,3 +185,43 @@ async def test_async_permission_reports_denial_callback_errors_and_missing_appro
     assert blocked_reason == (
         "Mutating action 'write_file' blocked: requires interactive approval."
     )
+
+
+def test_command_sandbox_grants_require_high_risk_approval_without_widening_allowlist():
+    from cli_agent.security import RiskLevel, SecurityPolicy
+
+    policy = SecurityPolicy(auto_approve=True)
+    ordinary = {"command": "echo hello"}
+    network_grant = {"command": "echo hello", "network_access": True}
+    fallback_grant = {"command": "echo hello", "allow_reduced_isolation": True}
+    background_grant = {
+        "command": "sleep 1",
+        "network_access": True,
+        "allow_reduced_isolation": True,
+    }
+
+    assert policy.evaluate_risk("run_command", ordinary) == RiskLevel.MEDIUM
+    assert policy.check_permission("run_command", ordinary)[0] is True
+    assert policy.evaluate_risk("run_command", network_grant) == RiskLevel.HIGH
+    assert policy.evaluate_risk("run_command", fallback_grant) == RiskLevel.HIGH
+    assert policy.evaluate_risk("start_background_process", background_grant) == RiskLevel.HIGH
+    assert policy.check_permission("run_command", network_grant)[0] is False
+    assert policy.check_permission("run_command", fallback_grant)[0] is False
+
+    policy.grant_session_permission("start_background_process", {"command": "sleep 1"})
+    assert policy.check_permission("start_background_process", {"command": "sleep 1"})[0] is True
+    assert policy.check_permission("start_background_process", background_grant)[0] is False
+    policy.grant_session_permission("start_background_process", background_grant)
+    assert policy.check_permission("start_background_process", background_grant)[0] is True
+    assert (
+        policy.check_permission(
+            "start_background_process",
+            {**background_grant, "command": "different process"},
+        )[0]
+        is False
+    )
+
+    policy.grant_session_permission("run_command", ordinary)
+    assert policy.check_permission("run_command", ordinary)[0] is True
+    assert policy.check_permission("run_command", network_grant)[0] is False
+    assert policy.check_permission("run_command", fallback_grant)[0] is False
