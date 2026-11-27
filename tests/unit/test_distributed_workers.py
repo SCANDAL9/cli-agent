@@ -3,11 +3,13 @@
 import asyncio
 import hashlib
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
 
+from cli_agent import worker_protocol
 from cli_agent.security import RiskLevel, SecurityPolicy
 from cli_agent.storage.turso import TursoLocalEngine
 from cli_agent.team import MultiAgentTeam
@@ -274,3 +276,55 @@ async def test_lease_expiry_during_approval_prevents_application(tmp_path):
         )
 
     assert (repo / "result.txt").read_text(encoding="utf-8") == "before\n"
+
+
+def test_expired_applying_lease_cannot_be_reclaimed_mid_application(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    clock = Clock()
+    coordinator = _coordinator(
+        tmp_path,
+        repo,
+        policy=SecurityPolicy(confirm_callback=lambda *_args: True),
+        clock=clock,
+    )
+    first_worker = coordinator.register_worker("worker-a")
+    second_worker = coordinator.register_worker("worker-b")
+    lease = coordinator.claim_task("task-a", first_worker, lease_seconds=5)
+    check_finished = threading.Event()
+    resume_application = threading.Event()
+    original_run = worker_protocol.subprocess.run
+
+    def pause_after_check(command, *args, **kwargs):
+        result = original_run(command, *args, **kwargs)
+        if command == ["git", "apply", "--check"]:
+            check_finished.set()
+            assert resume_application.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(worker_protocol.subprocess, "run", pause_after_check)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            lambda: asyncio.run(
+                coordinator.apply_worker_diff(
+                    lease,
+                    first_worker,
+                    PATCH,
+                    first_worker.sign_result(lease, PATCH),
+                )
+            )
+        )
+        try:
+            assert check_finished.wait(timeout=5)
+            clock.value = lease.expires_at + 1
+            with pytest.raises(WorkerLeaseUnavailable):
+                coordinator.claim_task("task-a", second_worker, lease_seconds=30)
+        finally:
+            resume_application.set()
+        result = future.result(timeout=5)
+
+    assert result.status == "applied"
+    assert (repo / "result.txt").read_text(encoding="utf-8") == "after\n"
+    assert coordinator.storage.execute(
+        "SELECT generation, status FROM worker_task_leases WHERE task_id = ?", ("task-a",)
+    )[0] == {"generation": 1, "status": "applied"}

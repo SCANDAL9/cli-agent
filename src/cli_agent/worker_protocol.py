@@ -145,14 +145,16 @@ class DistributedWorkerCoordinator:
                 status = 'claimed',
                 result_hash = NULL
             WHERE worker_task_leases.status = 'failed'
-               OR (worker_task_leases.status IN ('claimed', 'applying')
+               OR (worker_task_leases.status = 'claimed'
                    AND worker_task_leases.expires_at <= excluded.claimed_at)
             RETURNING generation
             """,
             (task_id, worker.worker_id, lease_id, now, expires_at),
         )
         if not rows:
-            raise WorkerLeaseUnavailable(f"Task '{task_id}' already has a live or completed lease.")
+            raise WorkerLeaseUnavailable(
+                f"Task '{task_id}' already has a live, applying, or completed lease."
+            )
         generation = int(rows[0]["generation"])
         unsigned = WorkerLease(
             task_id=task_id,
